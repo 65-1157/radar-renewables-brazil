@@ -1,0 +1,42 @@
+sites:
+  - id: salvador
+    name: Salvador
+    state: Bahia
+    lat: -12.9714
+    lon: -38.5014
+    type: coastal
+
+  - id: natal
+    name: Natal
+    state: Rio Grande do Norte
+    lat: -5.7945
+    lon: -35.2110
+    type: coastal
+
+  - id: fortaleza
+    name: Fortaleza
+    state: Ceara
+    lat: -3.7172
+    lon: -38.5433
+    type: coastal
+
+  - id: cabo_frio
+    name: Cabo Frio
+    state: Rio de Janeiro
+    lat: -22.8794
+    lon: -42.0190
+    type: coastal
+
+  - id: ilha_grande
+    name: Ilha Grande
+    state: Rio de Janeiro
+    lat: -23.1547
+    lon: -44.2229
+    type: coastal_island
+
+  - id: trindade
+    name: Ilha da Trindade
+    state: Atlantic Ocean
+    lat: -20.5133
+    lon: -29.3044
+    type: remote_island

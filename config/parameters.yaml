@@ -1,0 +1,63 @@
+# ── Data paths ────────────────────────────────────────────
+data:
+  raw_path: "../ai-renewable-energy-data-agent/data/processed/renewable_energy_brazil_coast_daily.csv"
+  processed_path: "data/"
+  date_start: "2020-01-01"
+  date_end: "2026-06-01"
+
+# ── Load profile ──────────────────────────────────────────
+load:
+  radar_kw: 15.0
+  processing_kw: 6.0
+  comms_kw: 3.0
+  hvac_summer_kw: 10.0
+  hvac_winter_kw: 4.0
+  lighting_kw: 2.0
+  ups_kw: 2.0
+  night_hvac_factor: 0.40
+  night_light_factor: 0.25
+  day_hours: 16
+  night_hours: 8
+  summer_months: [11, 12, 1, 2, 3]
+  winter_months: [6, 7, 8]
+
+# ── Solar PV ──────────────────────────────────────────────
+solar:
+  panel_area_m2: 50.0
+  efficiency: 0.20
+  performance_ratio: 0.78
+  scenarios_area_m2: [25, 50, 100, 150, 200]
+
+# ── Wind turbine ──────────────────────────────────────────
+wind:
+  cut_in_ms: 2.0
+  cut_out_ms: 15.0
+  rated_speed_ms: 11.0
+  rated_power_kw: 10.0
+  hub_height_m: 30.0
+  roughness_length: 0.01
+  n_turbines: 1
+  scenarios_n_turbines: [0, 1, 2, 3]
+
+# ── Diesel generator ──────────────────────────────────────
+diesel:
+  efficiency: 0.30
+  lhv_kwh_per_litre: 9.7
+  price_usd_per_litre: 1.20
+  co2_kg_per_litre: 2.68
+  trindade_price_usd_per_litre: 2.00
+
+# ── Economics ─────────────────────────────────────────────
+economics:
+  solar_capex_usd_per_kw: 1000.0
+  wind_capex_usd_per_kw: 2000.0
+  battery_capex_usd_per_kwh: 400.0
+  opex_pct_capex: 0.02
+  discount_rate: 0.08
+  project_life_years: 20
+
+# ── Simulation ────────────────────────────────────────────
+simulation:
+  battery_capacity_kwh: [0, 50, 100, 200]
+  battery_efficiency: 0.90
+  output_path: "outputs/"
