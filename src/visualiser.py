@@ -173,3 +173,194 @@ if __name__ == "__main__":
     plot_npv_heatmap(econ_table)
     plot_site_ranking(econ_table)
     print("\nAll plots saved to outputs/")
+
+
+# ---------------------------------------------------------------------------
+# Forecast visualisations — quantile fan charts and evaluation plots
+# ---------------------------------------------------------------------------
+
+def plot_forecast_fan(
+    fan: pd.DataFrame,
+    site: str,
+    variable: str,
+    actual: pd.Series = None,
+) -> None:
+    """
+    Fan chart for a single site + variable forecast.
+
+    Parameters
+    ----------
+    fan      : DataFrame with columns Q10, Q25, Q50, Q75, Q90 and DatetimeIndex
+    site     : site name (used in title and filename)
+    variable : "solar" or "wind"
+    actual   : optional pd.Series of observed values over the same period
+    """
+    color = SITE_COLORS.get(site, "#333333")
+    units = "kWh/m²/day" if variable == "solar" else "m/s"
+    label = "Solar irradiance" if variable == "solar" else "Wind speed (hub)"
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+
+    ax.fill_between(fan.index, fan["Q10"], fan["Q90"],
+                    alpha=0.15, color=color, label="Q10–Q90")
+    ax.fill_between(fan.index, fan["Q25"], fan["Q75"],
+                    alpha=0.30, color=color, label="Q25–Q75")
+    ax.plot(fan.index, fan["Q50"], color=color,
+            linewidth=2, label="Q50 (median)")
+
+    if actual is not None:
+        ax.plot(actual.index, actual.values, color="black",
+                linewidth=1, linestyle="--", label="Observed")
+
+    ax.set_xlabel("Date")
+    ax.set_ylabel(f"{label} ({units})")
+    ax.set_title(f"15-day probabilistic forecast — {site} / {variable}")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    plt.xticks(rotation=15, ha="right")
+
+    safe_site = site.replace(" ", "_").replace("/", "_")
+    save(fig, f"07_forecast_fan_{safe_site}_{variable}.png")
+
+
+def plot_forecast_fan_all_sites(
+    fans: Dict[str, pd.DataFrame],
+    variable: str,
+) -> None:
+    """
+    One subplot per site, all fan charts on a single figure.
+
+    Parameters
+    ----------
+    fans     : dict mapping site name -> fan DataFrame (Q10..Q90, DatetimeIndex)
+    variable : "solar" or "wind"
+    """
+    sites = list(fans.keys())
+    n = len(sites)
+    ncols = 3
+    nrows = int(np.ceil(n / ncols))
+    units = "kWh/m²/day" if variable == "solar" else "m/s"
+
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(6 * ncols, 4 * nrows),
+                             sharey=False)
+    axes = np.array(axes).flatten()
+
+    for i, site in enumerate(sites):
+        ax = axes[i]
+        fan = fans[site]
+        color = SITE_COLORS.get(site, "#333333")
+
+        ax.fill_between(fan.index, fan["Q10"], fan["Q90"],
+                        alpha=0.15, color=color)
+        ax.fill_between(fan.index, fan["Q25"], fan["Q75"],
+                        alpha=0.30, color=color)
+        ax.plot(fan.index, fan["Q50"], color=color, linewidth=2)
+
+        ax.set_title(site, fontsize=9)
+        ax.set_ylabel(units)
+        ax.grid(True, alpha=0.3)
+        ax.tick_params(axis="x", labelrotation=15, labelsize=7)
+
+    # Hide unused subplots
+    for j in range(n, len(axes)):
+        axes[j].set_visible(False)
+
+    fig.suptitle(
+        f"15-day probabilistic forecast — {variable} — all sites", y=1.01
+    )
+    plt.tight_layout()
+    save(fig, f"08_forecast_fan_all_{variable}.png")
+
+
+def plot_forecast_boxplot(
+    fans: Dict[str, pd.DataFrame],
+    variable: str,
+    day: int = 7,
+) -> None:
+    """
+    Box plot comparing Q10/Q25/Q50/Q75/Q90 across sites for forecast day N.
+
+    Parameters
+    ----------
+    fans     : dict mapping site name -> fan DataFrame
+    variable : "solar" or "wind"
+    day      : which forecast day to plot (1-based, default 7 = day ahead)
+    """
+    units = "kWh/m²/day" if variable == "solar" else "m/s"
+    sites = list(fans.keys())
+
+    # Build box stats manually from quantiles
+    box_data = []
+    for site in sites:
+        fan = fans[site]
+        if len(fan) < day:
+            continue
+        row = fan.iloc[day - 1]
+        box_data.append({
+            "site": site,
+            "q10": row["Q10"],
+            "q25": row["Q25"],
+            "q50": row["Q50"],
+            "q75": row["Q75"],
+            "q90": row["Q90"],
+        })
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    for i, d in enumerate(box_data):
+        color = SITE_COLORS.get(d["site"], "#333333")
+        # Draw box from Q25 to Q75
+        ax.bar(i, d["q75"] - d["q25"], bottom=d["q25"],
+               color=color, alpha=0.6, width=0.5)
+        # Median line
+        ax.plot([i - 0.25, i + 0.25], [d["q50"], d["q50"]],
+                color=color, linewidth=2)
+        # Whiskers Q10–Q90
+        ax.plot([i, i], [d["q10"], d["q25"]], color=color,
+                linewidth=1, linestyle="--")
+        ax.plot([i, i], [d["q75"], d["q90"]], color=color,
+                linewidth=1, linestyle="--")
+        # Caps
+        ax.plot([i - 0.15, i + 0.15], [d["q10"], d["q10"]],
+                color=color, linewidth=1)
+        ax.plot([i - 0.15, i + 0.15], [d["q90"], d["q90"]],
+                color=color, linewidth=1)
+
+    ax.set_xticks(range(len(box_data)))
+    ax.set_xticklabels([d["site"] for d in box_data],
+                       rotation=15, ha="right", fontsize=8)
+    ax.set_ylabel(f"{units}")
+    ax.set_title(
+        f"Forecast uncertainty by site — {variable} — day {day} ahead"
+    )
+    ax.grid(True, axis="y", alpha=0.3)
+    save(fig, f"09_forecast_boxplot_{variable}_day{day:02d}.png")
+
+
+def plot_eval_pinball(eval_df: pd.DataFrame, site: str, variable: str) -> None:
+    """
+    Bar chart of mean pinball loss per quantile from walk-forward evaluation.
+
+    Parameters
+    ----------
+    eval_df  : DataFrame from Forecaster.evaluate() with columns
+               label, pinball_loss
+    site     : site name
+    variable : "solar" or "wind"
+    """
+    mean_loss = eval_df.groupby("label")["pinball_loss"].mean()
+    color = SITE_COLORS.get(site, "#333333")
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.bar(mean_loss.index, mean_loss.values, color=color, alpha=0.8)
+    ax.set_xlabel("Quantile")
+    ax.set_ylabel("Mean pinball loss")
+    ax.set_title(
+        f"Walk-forward evaluation — {site} / {variable}\n"
+        f"(lower is better)"
+    )
+    ax.grid(True, axis="y", alpha=0.3)
+
+    safe_site = site.replace(" ", "_").replace("/", "_")
+    save(fig, f"10_eval_pinball_{safe_site}_{variable}.png")
