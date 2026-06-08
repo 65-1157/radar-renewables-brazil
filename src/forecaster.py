@@ -109,7 +109,7 @@ class SignalDecomposer:
         raw_trend = series.rolling(
             window=self.trend_window, center=True, min_periods=hw
         ).mean()
-        trend = raw_trend.fillna(method="ffill").fillna(method="bfill")
+        trend = raw_trend.ffill().bfill()
         self._trend = trend
 
         detrended = series - trend
@@ -352,7 +352,9 @@ class _QuantileLSTMModel:
         import torch
         total = torch.zeros(1, device=self._device)
         for qi, q in enumerate(QUANTILES):
-            err = targets - preds[:, qi, :]
+            p = preds[:, qi, :]                          # (B, H)
+            t = targets[:, qi, :] if targets.dim() == 3 else targets  # (B, H)
+            err = t - p
             loss = torch.where(err >= 0, q * err, (q - 1) * err)
             total = total + loss.mean()
         return total / len(QUANTILES)
@@ -375,8 +377,8 @@ class _QuantileLSTMModel:
         residuals: np.ndarray,
         n_trials: int = 20,
         val_frac: float = 0.15,
-        epochs_per_trial: int = 30,
-        patience_per_trial: int = 5,
+        epochs_per_trial: int = 15,
+        patience_per_trial: int = 3,
         verbose: bool = True,
     ) -> Dict:
         """
@@ -453,7 +455,7 @@ class _QuantileLSTMModel:
                     optim.zero_grad()
                     preds = net(xb)
                     loss = self._pinball_loss_torch(
-                        preds, yb.unsqueeze(1).expand_as(preds)
+                        preds, yb.unsqueeze(1).expand(preds.shape)
                     )
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
@@ -681,7 +683,7 @@ class _QuantileLSTMModel:
         flat_net = _FlatNet(self._net).to(self._device)
         flat_net.eval()
 
-        explainer = shap.DeepExplainer(flat_net, background)
+        explainer = shap.GradientExplainer(flat_net, background)
         shap_vals = explainer.shap_values(X_exp)
         stacked = np.stack(
             [sv[:, :, 0] for sv in shap_vals], axis=-1
@@ -768,7 +770,7 @@ class _QuantileLSTMModel:
         )
         logger.info("LSTM saved -> %s", path)
 
-    def load(self, path: Path) -> None:
+    def load(self, path: Path, residuals: Optional[np.ndarray] = None) -> None:
         import torch
         ckpt = torch.load(path, map_location=self._device)
         self.input_window = ckpt.get("input_window", DEFAULT_INPUT_WINDOW)
@@ -789,6 +791,12 @@ class _QuantileLSTMModel:
         self.val_losses = ckpt.get("val_losses", [])
         self.best_params = ckpt.get("best_params", {})
         self._is_trained = True
+        if residuals is not None:
+            scaled = (residuals - self._scaler_mean) / self._scaler_std
+            X, _ = self._make_sequences(scaled, self.input_window)
+            n_val = max(1, int(len(X) * 0.15))
+            self._X_train = X[:-n_val].copy()
+            self._X_val = X[-n_val:].copy()
         logger.info("LSTM loaded <- %s", path)
 
 
@@ -933,8 +941,8 @@ class Forecaster:
         site: str,
         n_trials: int = 20,
         val_frac: float = 0.15,
-        epochs_per_trial: int = 30,
-        patience_per_trial: int = 5,
+        epochs_per_trial: int = 15,
+        patience_per_trial: int = 3,
         verbose: bool = True,
         force_retune: bool = False,
     ) -> Dict:
@@ -1012,7 +1020,8 @@ class Forecaster:
 
         if model_path.exists() and not force_retrain:
             logger.info("Loading existing LSTM from %s", model_path)
-            model.load(model_path)
+            residuals = self._decomposers[site].residuals.values
+            model.load(model_path, residuals=residuals)
             if site not in self._lstm_fitted_sites:
                 self._lstm_fitted_sites.append(site)
             return model.train_losses, model.val_losses
