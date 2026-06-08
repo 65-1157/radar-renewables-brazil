@@ -27,6 +27,8 @@ Usage
 from __future__ import annotations
 
 import argparse
+import warnings
+warnings.filterwarnings("ignore", category=Warning, module="statsmodels")
 from pathlib import Path
 from typing import Optional
 
@@ -149,6 +151,70 @@ def cmd_forecast(args: argparse.Namespace) -> None:
         print("LIME top-10 features:")
         for feat, weight in exp.as_list():
             print(f"  {feat:20s}  {weight:+.5f}")
+
+
+def cmd_autonomy(args: argparse.Namespace) -> None:
+    """Run autonomy and battery sizing analysis."""
+    import yaml
+    from src.nasa_loader import (
+        load_params, load_combined_csv, quality_filter,
+        gap_fill, add_hub_height_wind, split_by_site,
+    )
+    from src.load_profile import build_load_series
+    from src.autonomy_model import run_autonomy_analysis
+
+    params = load_params(args.config)
+    with open(args.sites) as f:
+        sites_config = yaml.safe_load(f)["sites"]
+
+    df = load_combined_csv(params)
+    df = quality_filter(df)
+    df = gap_fill(df)
+    df = add_hub_height_wind(df, params)
+    all_data = split_by_site(df)
+
+    demand_df = build_load_series(
+        params["data"]["date_start"],
+        params["data"]["date_end"],
+        params,
+    )
+
+    solar_forecasters = None
+    wind_forecasters = None
+    if args.quantiles:
+        from src.forecaster import Forecaster
+        print("Fitting empirical forecasters for quantile analysis...")
+        sf = Forecaster(df, variable="solar")
+        sf.fit_empirical()
+        wf = Forecaster(df, variable="wind")
+        wf.fit_empirical()
+        solar_forecasters = {site: sf for site in all_data}
+        wind_forecasters = {site: wf for site in all_data}
+
+    run_autonomy_analysis(
+        all_data, demand_df, params, sites_config,
+        solar_forecasters=solar_forecasters,
+        wind_forecasters=wind_forecasters,
+        save_csv=True,
+        verbose=True,
+    )
+
+    if args.breakeven:
+        print("\nFinding autonomy breakeven scenarios...")
+        from src.autonomy_model import find_autonomy_breakeven
+        be = find_autonomy_breakeven(all_data, demand_df, params, sites_config)
+        be.to_csv("outputs/autonomy_breakeven.csv", index=False)
+        print("\nVIABLE AUTONOMY SCENARIOS (>= 10% autonomous days):")
+        viable = be[be["viable_autonomy"]]
+        if viable.empty:
+            print("  No scenarios achieve >= 10% autonomous days.")
+            print("  Minimum coverage achieved:")
+            print(be.groupby("location")["autonomous_days_pct"].max())
+        else:
+            print(viable[["location","panel_area_m2","n_turbines",
+                          "autonomous_days_pct","max_consecutive_days"]
+                        ].to_string(index=False))
+        print("Saved -> outputs/autonomy_breakeven.csv")
 
 
 def cmd_scenarios_quantiles(args: argparse.Namespace) -> None:
@@ -330,6 +396,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print LIME explanation for last forecast (requires --lstm)",
     )
 
+    # -- run-autonomy -------------------------------------------------------
+    p_aut = sub.add_parser(
+        "run-autonomy",
+        help="Autonomous operation and battery sizing analysis (answers RQ-A)",
+    )
+    p_aut.add_argument(
+        "--quantiles",
+        action="store_true",
+        help="Include Q10/Q50/Q90 autonomy analysis using empirical forecasters",
+    )
+    p_aut.add_argument(
+        "--breakeven",
+        action="store_true",
+        help="Find minimum installation size for >= 10pct autonomous days",
+    )
+
     # -- run-scenarios-quantiles --------------------------------------------
     p_scen_q = sub.add_parser(
         "run-scenarios-quantiles",
@@ -378,6 +460,7 @@ def main(argv: Optional[list] = None) -> None:
         "run-pipeline": cmd_pipeline,
         "run-scenarios": cmd_scenarios,
         "run-forecast": cmd_forecast,
+        "run-autonomy": cmd_autonomy,
         "run-scenarios-quantiles": cmd_scenarios_quantiles,
         "run-comparison": cmd_comparison,
     }
