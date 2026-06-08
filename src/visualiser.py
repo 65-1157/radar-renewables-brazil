@@ -423,3 +423,66 @@ def plot_shap_importance(
     ax.grid(True, axis="x", alpha=0.3)
     safe_site = site.replace(" ", "_").replace("/", "_")
     save(fig, f"12_shap_importance_{safe_site}_{variable}.png")
+
+
+def plot_comparison_heatmap(
+    comparison_df: pd.DataFrame,
+    variable: str,
+) -> None:
+    """
+    Heatmap of mean pinball loss per site per method.
+    Rows = sites, columns = methods, cells = mean pinball loss.
+    Lower is better — green = good, red = poor.
+
+    Parameters
+    ----------
+    comparison_df : DataFrame with columns site, quantile, + one col per method
+    variable      : "solar" or "wind"
+    """
+    import matplotlib.colors as mcolors
+
+    methods = [c for c in comparison_df.columns if c not in ("site", "quantile")]
+    sites = comparison_df["site"].unique().tolist()
+
+    # Mean across quantiles per site per method
+    pivot_rows = []
+    for site in sites:
+        sub = comparison_df[comparison_df["site"] == site]
+        row = {"site": site}
+        for m in methods:
+            if m in sub.columns:
+                row[m] = round(sub[m].mean(), 5)
+        pivot_rows.append(row)
+
+    import pandas as pd
+    pivot = pd.DataFrame(pivot_rows).set_index("site")[methods]
+
+    fig, ax = plt.subplots(figsize=(4 * len(methods), 6))
+    im = ax.imshow(
+        pivot.values, aspect="auto", cmap="RdYlGn_r",
+        vmin=pivot.values.min(), vmax=pivot.values.max(),
+    )
+
+    ax.set_xticks(range(len(methods)))
+    ax.set_xticklabels([m.upper() for m in methods], fontsize=10)
+    ax.set_yticks(range(len(sites)))
+    ax.set_yticklabels(sites, fontsize=9)
+
+    # Annotate cells
+    for i in range(len(sites)):
+        for j in range(len(methods)):
+            val = pivot.values[i, j]
+            ax.text(
+                j, i, f"{val:.4f}",
+                ha="center", va="center",
+                fontsize=8,
+                color="black",
+            )
+
+    plt.colorbar(im, ax=ax, label="Mean pinball loss (lower = better)")
+    ax.set_title(
+        f"Forecast method comparison — {variable} — all sites\n"
+        f"(mean pinball loss across Q10/Q25/Q50/Q75/Q90)"
+    )
+    plt.tight_layout()
+    save(fig, f"13_comparison_heatmap_{variable}.png")

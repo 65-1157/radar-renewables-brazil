@@ -5,9 +5,11 @@ CLI entrypoint for Radar Renewables Brazil.
 
 Subcommands
 -----------
-  run-pipeline   Load and validate NASA POWER data, print site summary
-  run-scenarios  Full scenario sweep -> outputs/scenario_*.csv
-  run-forecast   Probabilistic 15-day fan chart for one site + variable
+  run-pipeline    Load and validate NASA POWER data, print site summary
+  run-scenarios   Full scenario sweep -> outputs/scenario_*.csv
+  run-forecast    Probabilistic 15-day fan chart for one site + variable
+  run-comparison  Pinball loss table: persistence vs empirical vs LSTM
+                  across all 6 sites and both variables
 
 Usage
 -----
@@ -17,6 +19,9 @@ Usage
   python main.py run-forecast --site "Natal" --variable solar --lstm --epochs 50
   python main.py run-forecast --site "Natal" --variable solar --lstm --tune --n-trials 20
   python main.py run-forecast --site "Natal" --variable solar --lstm --tune --evaluate
+  python main.py run-comparison
+  python main.py run-comparison --variable solar
+  python main.py run-comparison --test-days 90
 """
 
 from __future__ import annotations
@@ -26,16 +31,30 @@ from pathlib import Path
 from typing import Optional
 
 
-def cmd_pipeline(args: argparse.Namespace) -> None:
+# ---------------------------------------------------------------------------
+# Shared data loader
+# ---------------------------------------------------------------------------
+
+def _load_df(config: str):
     from src.nasa_loader import (
         load_params, load_combined_csv, quality_filter,
-        gap_fill, add_hub_height_wind, split_by_site, summarise_all,
+        gap_fill, add_hub_height_wind,
     )
-    params = load_params(args.config)
+    params = load_params(config)
     df = load_combined_csv(params)
     df = quality_filter(df)
     df = gap_fill(df)
     df = add_hub_height_wind(df, params)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Sub-command handlers
+# ---------------------------------------------------------------------------
+
+def cmd_pipeline(args: argparse.Namespace) -> None:
+    from src.nasa_loader import split_by_site, summarise_all
+    df = _load_df(args.config)
     all_data = split_by_site(df)
     print("\n=== Site data summary ===")
     print(summarise_all(all_data).to_string(index=False))
@@ -53,18 +72,9 @@ def cmd_scenarios(args: argparse.Namespace) -> None:
 
 
 def cmd_forecast(args: argparse.Namespace) -> None:
-    from src.nasa_loader import (
-        load_params, load_combined_csv, quality_filter,
-        gap_fill, add_hub_height_wind,
-    )
     from src.forecaster import Forecaster
 
-    params = load_params(args.config)
-    df = load_combined_csv(params)
-    df = quality_filter(df)
-    df = gap_fill(df)
-    df = add_hub_height_wind(df, params)
-
+    df = _load_df(args.config)
     site = args.site
     variable = args.variable
     n_days = args.days
@@ -76,10 +86,7 @@ def cmd_forecast(args: argparse.Namespace) -> None:
     if args.lstm:
         try:
             if args.tune:
-                print(
-                    f"Running Optuna search "
-                    f"({args.n_trials} trials)..."
-                )
+                print(f"Running Optuna search ({args.n_trials} trials)...")
                 best = fcast.tune_lstm(
                     site=site,
                     n_trials=args.n_trials,
@@ -101,8 +108,6 @@ def cmd_forecast(args: argparse.Namespace) -> None:
                     f"val={val_losses[-1]:.5f}  "
                     f"gap={val_losses[-1]-train_losses[-1]:.5f}"
                 )
-
-                # Save train/val loss plot
                 from src.visualiser import plot_train_val_loss
                 plot_train_val_loss(train_losses, val_losses, site, variable)
 
@@ -146,6 +151,70 @@ def cmd_forecast(args: argparse.Namespace) -> None:
             print(f"  {feat:20s}  {weight:+.5f}")
 
 
+def cmd_comparison(args: argparse.Namespace) -> None:
+    """
+    Run walk-forward pinball loss comparison across all sites.
+    Produces:
+      outputs/comparison_<variable>.csv   — full table
+      outputs/13_comparison_<variable>.png — heatmap
+    """
+    import pandas as pd
+    from src.forecaster import Forecaster, SITES
+    from src.visualiser import plot_comparison_heatmap
+
+    df = _load_df(args.config)
+    out_dir = Path("outputs")
+    out_dir.mkdir(exist_ok=True)
+
+    variables = (
+        [args.variable] if args.variable
+        else ["solar", "wind"]
+    )
+
+    for variable in variables:
+        print(f"\n{'='*60}")
+        print(f"METHOD COMPARISON — {variable.upper()} — all sites")
+        print(f"{'='*60}")
+
+        fcast = Forecaster(df, variable=variable)
+        fcast.fit_empirical()
+
+        all_rows = []
+        for site in SITES:
+            print(f"  Evaluating {site}...", end=" ", flush=True)
+            try:
+                comp = fcast.compare_methods(
+                    site=site, test_days=args.test_days
+                )
+                comp.insert(0, "site", site)
+                all_rows.append(comp)
+                print("done")
+            except Exception as e:
+                print(f"SKIPPED ({e})")
+
+        if not all_rows:
+            print("No results — check data.")
+            continue
+
+        full_table = pd.concat(all_rows, ignore_index=True)
+
+        # Print summary
+        print(f"\nMean pinball loss — {variable} — all sites:")
+        print(full_table.to_string(index=False))
+
+        # Save CSV
+        csv_path = out_dir / f"comparison_{variable}.csv"
+        full_table.to_csv(csv_path, index=False)
+        print(f"\nSaved -> {csv_path}")
+
+        # Save heatmap
+        plot_comparison_heatmap(full_table, variable)
+
+
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python main.py",
@@ -163,12 +232,17 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
     sub.required = True
 
+    # -- run-pipeline -------------------------------------------------------
     sub.add_parser("run-pipeline", help="Load data and print site summary")
 
+    # -- run-scenarios ------------------------------------------------------
     p_scen = sub.add_parser("run-scenarios", help="Full scenario sweep")
     p_scen.add_argument("--no-save", action="store_true")
 
-    p_fc = sub.add_parser("run-forecast", help="15-day probabilistic forecast")
+    # -- run-forecast -------------------------------------------------------
+    p_fc = sub.add_parser(
+        "run-forecast", help="15-day probabilistic forecast for one site"
+    )
     p_fc.add_argument(
         "--site", required=True,
         choices=[
@@ -179,9 +253,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_fc.add_argument(
         "--variable", required=True, choices=["solar", "wind"]
     )
-    p_fc.add_argument(
-        "--days", type=int, default=15, metavar="N"
-    )
+    p_fc.add_argument("--days", type=int, default=15, metavar="N")
     p_fc.add_argument(
         "--lstm", action="store_true",
         help="Train/use LSTM (requires: pip install torch)",
@@ -194,9 +266,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--n-trials", type=int, default=20, metavar="N",
         help="Number of Optuna trials (default: 20)",
     )
-    p_fc.add_argument(
-        "--epochs", type=int, default=100, metavar="N"
-    )
+    p_fc.add_argument("--epochs", type=int, default=100, metavar="N")
     p_fc.add_argument(
         "--retrain", action="store_true",
         help="Force retrain even if checkpoint exists",
@@ -214,8 +284,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print LIME explanation for last forecast (requires --lstm)",
     )
 
+    # -- run-comparison -----------------------------------------------------
+    p_cmp = sub.add_parser(
+        "run-comparison",
+        help=(
+            "Pinball loss table: persistence vs empirical vs LSTM "
+            "across all 6 sites"
+        ),
+    )
+    p_cmp.add_argument(
+        "--variable",
+        choices=["solar", "wind"],
+        default=None,
+        help="Limit to one variable (default: both)",
+    )
+    p_cmp.add_argument(
+        "--test-days",
+        type=int,
+        default=90,
+        metavar="N",
+        help="Walk-forward test window in days (default: 90)",
+    )
+
     return parser
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main(argv: Optional[list] = None) -> None:
     parser = build_parser()
@@ -224,6 +320,7 @@ def main(argv: Optional[list] = None) -> None:
         "run-pipeline": cmd_pipeline,
         "run-scenarios": cmd_scenarios,
         "run-forecast": cmd_forecast,
+        "run-comparison": cmd_comparison,
     }
     dispatch[args.command](args)
 
