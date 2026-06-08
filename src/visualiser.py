@@ -21,7 +21,7 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 def save(fig: plt.Figure, name: str) -> None:
     path = OUTPUT_DIR / name
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    fig.savefig(path, dpi=600, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {path}")
 
