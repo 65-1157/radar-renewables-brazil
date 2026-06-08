@@ -151,6 +151,17 @@ def cmd_forecast(args: argparse.Namespace) -> None:
             print(f"  {feat:20s}  {weight:+.5f}")
 
 
+def cmd_scenarios_quantiles(args: argparse.Namespace) -> None:
+    """Run Q10/Q50/Q90 scenario sweep."""
+    from src.scenario_runner import run_all_quantiles
+    run_all_quantiles(
+        config_path=args.config,
+        sites_config_path=args.sites,
+        save_csv=not args.no_save,
+        verbose=True,
+    )
+
+
 def cmd_comparison(args: argparse.Namespace) -> None:
     """
     Run walk-forward pinball loss comparison across all sites.
@@ -284,6 +295,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print LIME explanation for last forecast (requires --lstm)",
     )
 
+    # -- run-scenarios-quantiles --------------------------------------------
+    p_scen_q = sub.add_parser(
+        "run-scenarios-quantiles",
+        help="Q10/Q50/Q90 diesel + economics sweep -> outputs/scenario_*_quantiles.csv",
+    )
+    p_scen_q.add_argument("--no-save", action="store_true")
+
     # -- run-comparison -----------------------------------------------------
     p_cmp = sub.add_parser(
         "run-comparison",
@@ -320,6 +338,7 @@ def main(argv: Optional[list] = None) -> None:
         "run-pipeline": cmd_pipeline,
         "run-scenarios": cmd_scenarios,
         "run-forecast": cmd_forecast,
+        "run-scenarios-quantiles": cmd_scenarios_quantiles,
         "run-comparison": cmd_comparison,
     }
     dispatch[args.command](args)

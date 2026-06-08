@@ -112,3 +112,67 @@ if __name__ == "__main__":
     print("\n=== Wind scenario table (n_turbines x site) ===")
     table = wind_scenario_table(all_data, params)
     print(table.to_string(index=False))
+
+
+# ---------------------------------------------------------------------------
+# Quantile extensions
+# ---------------------------------------------------------------------------
+
+def run_wind_model_quantiles(
+    fan_df: pd.DataFrame,
+    params: dict,
+    n_turbines: int = None,
+) -> pd.DataFrame:
+    """
+    Apply turbine power curve to each quantile column of a wind fan DataFrame.
+
+    The power curve is nonlinear (cubic between cut-in and rated speed),
+    so quantiles must be propagated through the actual curve — not scaled
+    linearly from Q50.
+
+    Parameters
+    ----------
+    fan_df     : DataFrame with columns Q10, Q25, Q50, Q75, Q90
+                 containing wind speed values in m/s
+    params     : parameters dict
+    n_turbines : number of turbines (overrides params default)
+
+    Returns
+    -------
+    DataFrame with columns wind_Q10, wind_Q25, wind_Q50, wind_Q75, wind_Q90
+    in kWh/day.
+    """
+    p = params["wind"]
+    n = n_turbines if n_turbines is not None else p["n_turbines"]
+
+    result = pd.DataFrame(index=fan_df.index)
+    for q_lbl in ["Q10", "Q25", "Q50", "Q75", "Q90"]:
+        if q_lbl in fan_df.columns:
+            result[f"wind_{q_lbl}"] = daily_wind_output(
+                fan_df[q_lbl],
+                cut_in=p["cut_in_ms"],
+                cut_out=p["cut_out_ms"],
+                rated_speed=p["rated_speed_ms"],
+                rated_power=p["rated_power_kw"],
+                n_turbines=n,
+            )
+    return result
+
+
+def wind_quantile_summary(wind_fan: pd.DataFrame) -> dict:
+    """
+    Annual summary from a wind quantile fan DataFrame.
+
+    Returns dict with annual_wind_mwh_Q10, _Q50, _Q90 and
+    daily_mean_kwh_Q10, _Q50, _Q90.
+    """
+    summary = {}
+    for q_lbl in ["Q10", "Q50", "Q90"]:
+        col = f"wind_{q_lbl}"
+        if col in wind_fan.columns:
+            annual = wind_fan[col].sum()
+            summary[f"annual_wind_mwh_{q_lbl}"] = round(annual / 1000, 3)
+            summary[f"daily_mean_kwh_{q_lbl}"] = round(
+                wind_fan[col].mean(), 2
+            )
+    return summary

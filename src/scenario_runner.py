@@ -218,3 +218,101 @@ def run_all(
 
 if __name__ == "__main__":
     run_all()
+
+
+def run_all_quantiles(
+    config_path: str = "config/parameters.yaml",
+    sites_config_path: str = "config/sites.yaml",
+    save_csv: bool = True,
+    verbose: bool = True,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Full quantile sweep — Q10/Q50/Q90 for diesel and economics.
+
+    Requires empirical forecasters for all sites (no LSTM needed).
+    Uses SiteCorrelationEstimator for joint solar-wind worst case.
+
+    Keys in returned dict
+    ---------------------
+    "diesel_q"   : diesel_quantile_scenario_table output
+    "economics_q": economics_quantile_table output
+    """
+    import time
+    import yaml
+    from src.nasa_loader import (
+        load_params, load_combined_csv, quality_filter,
+        gap_fill, add_hub_height_wind, split_by_site,
+    )
+    from src.load_profile import build_load_series
+    from src.forecaster import (
+        Forecaster, SiteCorrelationEstimator,
+    )
+    from src.diesel_model import diesel_quantile_scenario_table
+    from src.economics import (
+        economics_quantile_table, print_quantile_economics_summary
+    )
+
+    t0 = time.time()
+    _ensure_output_dir()
+
+    def log(msg: str) -> None:
+        if verbose:
+            print(msg)
+
+    log("\n[1/5] Loading NASA POWER data...")
+    params = load_params(config_path)
+    sites_config = _load_sites_config(sites_config_path)
+    df = load_combined_csv(params)
+    df = quality_filter(df)
+    df = gap_fill(df)
+    df = add_hub_height_wind(df, params)
+    all_data = split_by_site(df)
+    log(f"    {len(all_data)} sites loaded.")
+
+    log("\n[2/5] Building load profile...")
+    demand_df = build_load_series(
+        params["data"]["date_start"],
+        params["data"]["date_end"],
+        params,
+    )
+
+    log("\n[3/5] Fitting empirical forecasters...")
+    solar_fcast = Forecaster(df, variable="solar")
+    solar_fcast.fit_empirical()
+    wind_fcast = Forecaster(df, variable="wind")
+    wind_fcast.fit_empirical()
+    solar_forecasters = {site: solar_fcast for site in all_data}
+    wind_forecasters = {site: wind_fcast for site in all_data}
+
+    log("\n[4/5] Estimating solar-wind correlations...")
+    corr = SiteCorrelationEstimator()
+    for site in all_data:
+        sol_resid = solar_fcast._decomposers[site].residuals
+        wnd_resid = wind_fcast._decomposers[site].residuals
+        corr.fit(sol_resid, wnd_resid, site)
+        log(f"    {site}: {corr.correlations[site]}")
+
+    n_combos = (
+        len(params["solar"]["scenarios_area_m2"])
+        * len(params["wind"]["scenarios_n_turbines"])
+        * len(all_data)
+    )
+    log(f"\n[5/5] Running quantile sweep ({n_combos} combinations)...")
+
+    diesel_q = diesel_quantile_scenario_table(
+        all_data, demand_df, params, sites_config,
+        solar_forecasters, wind_forecasters, corr,
+    )
+    econ_q = economics_quantile_table(diesel_q, params)
+
+    if save_csv:
+        _save(diesel_q, "scenario_diesel_quantiles.csv", verbose)
+        _save(econ_q, "scenario_economics_quantiles.csv", verbose)
+
+    elapsed = time.time() - t0
+    log(f"\nDone in {elapsed:.1f}s")
+
+    if verbose:
+        print_quantile_economics_summary(econ_q, top_n=10)
+
+    return {"diesel_q": diesel_q, "economics_q": econ_q}

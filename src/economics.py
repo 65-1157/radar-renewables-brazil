@@ -126,3 +126,99 @@ if __name__ == "__main__":
     cols = ["location", "panel_area_m2", "n_turbines", "renewable_pct",
             "cost_saved_usd_yr", "capex_usd", "npv_usd", "payback_yr", "lcoe_usd_kwh"]
     print(econ[cols].head(15).to_string(index=False))
+
+
+# ---------------------------------------------------------------------------
+# Quantile extensions
+# ---------------------------------------------------------------------------
+
+def economics_quantile_table(
+    diesel_q_table: pd.DataFrame,
+    params: dict,
+) -> pd.DataFrame:
+    """
+    Compute NPV, payback, and LCOE for Q10, Q50, Q90 scenarios.
+
+    Parameters
+    ----------
+    diesel_q_table : output of diesel_quantile_scenario_table()
+                     must contain cost_saved_usd_Q10/Q50/Q90,
+                     baseline_litres, litres_saved_Q10/Q50/Q90
+    params         : parameters dict
+
+    Returns
+    -------
+    DataFrame adding columns:
+      npv_usd_Q10, npv_usd_Q50, npv_usd_Q90
+      payback_yr_Q10, payback_yr_Q50, payback_yr_Q90
+      lcoe_usd_kwh_Q10, lcoe_usd_kwh_Q50, lcoe_usd_kwh_Q90
+    """
+    battery_kwh = params["simulation"]["battery_capacity_kwh"][1]
+    rows = []
+
+    for _, row in diesel_q_table.iterrows():
+        area = row["panel_area_m2"]
+        n = row["n_turbines"]
+        cap = capex_usd(area, n, battery_kwh, params)
+
+        new_row = row.to_dict()
+
+        for q_lbl in ["Q10", "Q50", "Q90"]:
+            saving = float(row.get(f"cost_saved_usd_{q_lbl}", 0.0))
+
+            # Annual RE kWh from diesel litres saved
+            litres_saved = float(
+                row["baseline_litres"]
+                - row.get(f"diesel_litres_{q_lbl}", row["baseline_litres"])
+            )
+            annual_re_kwh = (
+                litres_saved
+                * params["diesel"]["efficiency"]
+                * params["diesel"]["lhv_kwh_per_litre"]
+            )
+
+            new_row[f"npv_usd_{q_lbl}"] = npv_usd(saving, cap, params)
+            new_row[f"payback_yr_{q_lbl}"] = payback_years(
+                saving, cap, params
+            )
+            new_row[f"lcoe_usd_kwh_{q_lbl}"] = lcoe_usd_per_kwh(
+                cap, annual_re_kwh, params
+            )
+
+        rows.append(new_row)
+
+    result = pd.DataFrame(rows).sort_values(
+        "npv_usd_Q50", ascending=False
+    ).reset_index(drop=True)
+
+    return result
+
+
+def print_quantile_economics_summary(
+    econ_q: pd.DataFrame,
+    top_n: int = 10,
+) -> None:
+    """
+    Print a formatted summary of the top N scenarios by Q50 NPV,
+    showing Q10/Q50/Q90 uncertainty intervals.
+    """
+    sep = "=" * 75
+    print(f"\n{sep}")
+    print(f"TOP {top_n} SCENARIOS — NPV UNCERTAINTY (Q10 / Q50 / Q90)")
+    print(sep)
+
+    cols = [
+        "location", "panel_area_m2", "n_turbines",
+        "renewable_pct_Q50",
+        "npv_usd_Q10", "npv_usd_Q50", "npv_usd_Q90",
+        "payback_yr_Q10", "payback_yr_Q50", "payback_yr_Q90",
+    ]
+    available = [c for c in cols if c in econ_q.columns]
+    # Only show viable scenarios (positive Q50 NPV)
+    viable = econ_q[econ_q["npv_usd_Q50"] > 0] if "npv_usd_Q50" in econ_q.columns else econ_q
+    if viable.empty:
+        print("No scenarios with positive NPV found.")
+        print("Showing top 10 by Q50 NPV regardless:")
+        print(econ_q[available].head(top_n).to_string(index=False))
+    else:
+        print(viable[available].head(top_n).to_string(index=False))

@@ -91,3 +91,59 @@ if __name__ == "__main__":
     print("\n=== Solar PV scenario table ===")
     table = solar_scenario_table(all_data, params)
     print(table.to_string(index=False))
+
+
+# ---------------------------------------------------------------------------
+# Quantile extensions
+# ---------------------------------------------------------------------------
+
+def run_solar_model_quantiles(
+    fan_df: pd.DataFrame,
+    params: dict,
+    area_m2: float = None,
+) -> pd.DataFrame:
+    """
+    Apply PV formula to each quantile column of a solar fan DataFrame.
+
+    Parameters
+    ----------
+    fan_df  : DataFrame with columns Q10, Q25, Q50, Q75, Q90 and DatetimeIndex
+              (output of Forecaster.forecast_empirical / forecast_lstm)
+    params  : parameters dict
+    area_m2 : panel area in m² (overrides params default)
+
+    Returns
+    -------
+    DataFrame with columns pv_Q10, pv_Q25, pv_Q50, pv_Q75, pv_Q90
+    """
+    p = params["solar"]
+    area = area_m2 if area_m2 is not None else p["panel_area_m2"]
+    eff = p["efficiency"]
+    pr = p["performance_ratio"]
+
+    result = pd.DataFrame(index=fan_df.index)
+    for q_lbl in ["Q10", "Q25", "Q50", "Q75", "Q90"]:
+        if q_lbl in fan_df.columns:
+            result[f"pv_{q_lbl}"] = (
+                fan_df[q_lbl] * area * eff * pr
+            ).round(3)
+    return result
+
+
+def solar_quantile_summary(pv_fan: pd.DataFrame) -> dict:
+    """
+    Annual summary statistics from a PV quantile fan DataFrame.
+
+    Returns dict with annual_pv_mwh_Q10, _Q50, _Q90 and
+    daily_mean_kwh_Q10, _Q50, _Q90.
+    """
+    summary = {}
+    for q_lbl in ["Q10", "Q50", "Q90"]:
+        col = f"pv_{q_lbl}"
+        if col in pv_fan.columns:
+            annual = pv_fan[col].sum()
+            summary[f"annual_pv_mwh_{q_lbl}"] = round(annual / 1000, 3)
+            summary[f"daily_mean_kwh_{q_lbl}"] = round(
+                pv_fan[col].mean(), 2
+            )
+    return summary
