@@ -29,6 +29,9 @@ from __future__ import annotations
 import argparse
 import warnings
 warnings.filterwarnings("ignore", category=Warning, module="statsmodels")
+warnings.filterwarnings("ignore", message=".*converge.*")
+warnings.filterwarnings("ignore", message=".*mle_retvals.*")
+warnings.filterwarnings("ignore", category=UserWarning)
 from pathlib import Path
 from typing import Optional
 
@@ -151,6 +154,63 @@ def cmd_forecast(args: argparse.Namespace) -> None:
         print("LIME top-10 features:")
         for feat, weight in exp.as_list():
             print(f"  {feat:20s}  {weight:+.5f}")
+
+
+def cmd_dispatch(args: argparse.Namespace) -> None:
+    """Run dispatch strategy analysis — answers RQ-B."""
+    import yaml
+    from src.nasa_loader import (
+        load_params, load_combined_csv, quality_filter,
+        gap_fill, add_hub_height_wind, split_by_site,
+    )
+    from src.load_profile import build_load_series
+    from src.dispatch_model import run_dispatch_analysis
+
+    params = load_params(args.config)
+    with open(args.sites) as f:
+        sites_config = yaml.safe_load(f)["sites"]
+
+    df = load_combined_csv(params)
+    df = quality_filter(df)
+    df = gap_fill(df)
+    df = add_hub_height_wind(df, params)
+    all_data = split_by_site(df)
+
+    demand_df = build_load_series(
+        params["data"]["date_start"],
+        params["data"]["date_end"],
+        params,
+    )
+
+    solar_forecaster = None
+    wind_forecaster = None
+    if args.forecast:
+        from src.forecaster import Forecaster
+        print("Loading forecasters for Strategy 3...")
+        sf = Forecaster(df, variable="solar")
+        sf.fit_empirical()
+        wf = Forecaster(df, variable="wind")
+        wf.fit_empirical()
+        for site in all_data:
+            try:
+                sf.fit_lstm(site=site, verbose=False)
+                wf.fit_lstm(site=site, verbose=False)
+                print(f"  LSTM loaded: {site}")
+            except Exception:
+                pass
+        solar_forecaster = sf
+        wind_forecaster = wf
+
+    run_dispatch_analysis(
+        all_data, demand_df, params, sites_config,
+        solar_forecaster=solar_forecaster,
+        wind_forecaster=wind_forecaster,
+        area_m2=args.area,
+        n_turbines=args.turbines,
+        battery_kwh=args.battery,
+        save_csv=True,
+        verbose=True,
+    )
 
 
 def cmd_autonomy(args: argparse.Namespace) -> None:
@@ -396,6 +456,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print LIME explanation for last forecast (requires --lstm)",
     )
 
+    # -- run-dispatch -------------------------------------------------------
+    p_dsp = sub.add_parser(
+        "run-dispatch",
+        help="Dispatch strategy comparison S1/S2/S3 (answers RQ-B)",
+    )
+    p_dsp.add_argument("--area", type=float, default=200.0,
+                       help="Panel area m2 (default 200)")
+    p_dsp.add_argument("--turbines", type=int, default=3,
+                       help="Number of turbines (default 3)")
+    p_dsp.add_argument("--battery", type=float, default=500.0,
+                       help="Battery capacity kWh (default 500)")
+    p_dsp.add_argument("--forecast", action="store_true",
+                       help="Use LSTM forecaster for Strategy 3")
+
     # -- run-autonomy -------------------------------------------------------
     p_aut = sub.add_parser(
         "run-autonomy",
@@ -460,6 +534,7 @@ def main(argv: Optional[list] = None) -> None:
         "run-pipeline": cmd_pipeline,
         "run-scenarios": cmd_scenarios,
         "run-forecast": cmd_forecast,
+        "run-dispatch": cmd_dispatch,
         "run-autonomy": cmd_autonomy,
         "run-scenarios-quantiles": cmd_scenarios_quantiles,
         "run-comparison": cmd_comparison,
