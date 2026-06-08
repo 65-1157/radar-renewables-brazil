@@ -14,17 +14,21 @@ Architecture
 
   Quantiles : Q10, Q25, Q50, Q75, Q90
   Loss      : pinball (quantile regression) loss — one head per quantile
-  Input window : 60 days of noise residuals
+  Input window : 60 days of noise residuals (or Optuna-optimised)
   Forecast horizon : 15 days ahead
   Models    : 12 total (6 sites x 2 variables)
 
-Improvements in this version
------------------------------
-  - Train loss logged alongside val loss every epoch
-  - Early stopping watches both patience AND train/val gap
-  - SHAP (DeepExplainer) computes global feature importance after training
-  - LIME (LimeTabularExplainer) explains individual forecasts locally
-  - Persistence baseline for comparison against LSTM
+Hyperparameter optimisation
+----------------------------
+  Optuna TPE sampler searches:
+    hidden_size  : [32, 64, 96, 128]
+    num_layers   : [1, 2, 3]
+    dropout      : [0.1, 0.5]
+    lr           : [1e-4, 1e-2]  log scale
+    batch_size   : [32, 64, 128]
+    input_window : [30, 45, 60, 90]
+  Objective : mean val pinball loss over all quantiles
+  Best params saved alongside model checkpoint.
 
 Python 3.9 compatible — uses Optional[X] not X | Y.
 """
@@ -59,10 +63,17 @@ SITES: List[str] = [
 VARIABLES: List[str] = ["solar", "wind"]
 
 TREND_WINDOW: int = 365
-INPUT_WINDOW: int = 60
 FORECAST_HORIZON: int = 15
 MIN_TRAIN_DAYS: int = 730
-GAP_THRESHOLD: float = 0.05  # max tolerated train/val pinball gap
+GAP_THRESHOLD: float = 0.05
+
+# Default hyperparameters (used when Optuna is skipped)
+DEFAULT_INPUT_WINDOW: int = 60
+DEFAULT_HIDDEN_SIZE: int = 64
+DEFAULT_NUM_LAYERS: int = 2
+DEFAULT_DROPOUT: float = 0.2
+DEFAULT_LR: float = 1e-3
+DEFAULT_BATCH_SIZE: int = 64
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +122,11 @@ class SignalDecomposer:
             counts[d] += 1
         with np.errstate(invalid="ignore"):
             profile = np.where(counts > 0, profile / counts, 0.0)
-        smooth = pd.Series(profile[1:]).rolling(15, center=True, min_periods=1).mean()
+        smooth = (
+            pd.Series(profile[1:])
+            .rolling(15, center=True, min_periods=1)
+            .mean()
+        )
         self._seasonal_profile = np.concatenate([[0.0], smooth.values])
 
         seasonal_vals = np.array([self._seasonal_profile[d] for d in doy])
@@ -202,8 +217,7 @@ class EmpiricalQuantileForecaster:
             row["date"] = future_dates[i]
             rows.append(row)
 
-        df = pd.DataFrame(rows).set_index("date")
-        return df.clip(lower=0.0)
+        return pd.DataFrame(rows).set_index("date").clip(lower=0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -211,10 +225,7 @@ class EmpiricalQuantileForecaster:
 # ---------------------------------------------------------------------------
 
 class PersistenceForecaster:
-    """
-    Naive baseline: forecast = last observed value repeated for all horizons.
-    Used to benchmark LSTM and empirical models on pinball loss.
-    """
+    """Naive baseline: last observed value repeated for all horizons."""
 
     def __init__(self, decomposer: SignalDecomposer) -> None:
         self._dc = decomposer
@@ -235,14 +246,49 @@ class PersistenceForecaster:
 
         rows = []
         for i, dt in enumerate(future_dates):
-            base = trend[i] + seasonal[i] + last_resid
-            base = max(0.0, base)
-            # Persistence has no spread — all quantiles equal the point forecast
+            base = max(0.0, trend[i] + seasonal[i] + last_resid)
             row = {lbl: base for lbl in QUANTILE_LABELS}
             row["date"] = dt
             rows.append(row)
 
         return pd.DataFrame(rows).set_index("date")
+
+
+# ---------------------------------------------------------------------------
+# LSTM network definition (standalone so Optuna can reinstantiate it)
+# ---------------------------------------------------------------------------
+
+def _build_net(
+    hidden_size: int,
+    num_layers: int,
+    dropout: float,
+    n_quantiles: int,
+    horizon: int,
+):
+    """Build and return a fresh LSTM network."""
+    import torch.nn as nn
+
+    class _Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lstm = nn.LSTM(
+                input_size=1,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                batch_first=True,
+                dropout=dropout if num_layers > 1 else 0.0,
+            )
+            self.head = nn.Linear(hidden_size, n_quantiles * horizon)
+            self.nq = n_quantiles
+            self.h = horizon
+
+        def forward(self, x):
+            out, _ = self.lstm(x)
+            last = out[:, -1, :]
+            raw = self.head(last)
+            return raw.view(-1, self.nq, self.h)
+
+    return _Net()
 
 
 # ---------------------------------------------------------------------------
@@ -259,72 +305,50 @@ def _try_import_torch() -> bool:
 
 class _QuantileLSTMModel:
     """
-    Multi-quantile LSTM with:
-      - Train + val pinball loss tracked every epoch
-      - Early stopping on val loss (patience) AND train/val gap
-      - SHAP DeepExplainer for global feature importance
-      - LIME LimeTabularExplainer for local per-forecast explanation
+    Multi-quantile LSTM with Optuna hyperparameter search,
+    train/val loss tracking, gap-based early stopping,
+    SHAP global feature importance, and LIME local explanations.
     """
 
     def __init__(
         self,
-        input_window: int = INPUT_WINDOW,
+        input_window: int = DEFAULT_INPUT_WINDOW,
         horizon: int = FORECAST_HORIZON,
-        hidden_size: int = 64,
-        num_layers: int = 2,
-        dropout: float = 0.2,
+        hidden_size: int = DEFAULT_HIDDEN_SIZE,
+        num_layers: int = DEFAULT_NUM_LAYERS,
+        dropout: float = DEFAULT_DROPOUT,
     ) -> None:
         if not _try_import_torch():
             raise ImportError(
-                "PyTorch is required for LSTM training. "
-                "Install with: pip install torch"
+                "PyTorch is required. Install with: pip install torch"
             )
         import torch
-        import torch.nn as nn
 
         self.input_window = input_window
         self.horizon = horizon
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.dropout = dropout
         self.n_quantiles = len(QUANTILES)
-        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
 
-        class _Net(nn.Module):
-            def __init__(
-                self, hidden: int, layers: int, drop: float, nq: int, h: int
-            ):
-                super().__init__()
-                self.lstm = nn.LSTM(
-                    input_size=1,
-                    hidden_size=hidden,
-                    num_layers=layers,
-                    batch_first=True,
-                    dropout=drop if layers > 1 else 0.0,
-                )
-                self.head = nn.Linear(hidden, nq * h)
-                self.nq = nq
-                self.h = h
+        self._net = _build_net(
+            hidden_size, num_layers, dropout, self.n_quantiles, horizon
+        ).to(self._device)
 
-            def forward(self, x):
-                out, _ = self.lstm(x)
-                last = out[:, -1, :]
-                raw = self.head(last)
-                return raw.view(-1, self.nq, self.h)
-
-        self._net = _Net(hidden_size, num_layers, dropout, self.n_quantiles, horizon)
-        self._net.to(self._device)
         self._scaler_mean: float = 0.0
         self._scaler_std: float = 1.0
         self._is_trained: bool = False
-
-        # Stored after training for SHAP/LIME
         self._X_train: Optional[np.ndarray] = None
         self._X_val: Optional[np.ndarray] = None
-
-        # Training history
         self.train_losses: List[float] = []
         self.val_losses: List[float] = []
+        self.best_params: Dict = {}
 
     # ------------------------------------------------------------------
-    def _pinball_loss(self, preds, targets):
+    def _pinball_loss_torch(self, preds, targets):
         import torch
         total = torch.zeros(1, device=self._device)
         for qi, q in enumerate(QUANTILES):
@@ -334,10 +358,10 @@ class _QuantileLSTMModel:
         return total / len(QUANTILES)
 
     def _make_sequences(
-        self, residuals: np.ndarray
+        self, residuals: np.ndarray, input_window: int
     ) -> Tuple[np.ndarray, np.ndarray]:
         X, Y = [], []
-        T = self.input_window
+        T = input_window
         H = self.horizon
         n = len(residuals)
         for start in range(n - T - H + 1):
@@ -346,40 +370,182 @@ class _QuantileLSTMModel:
         return np.array(X, dtype=np.float32), np.array(Y, dtype=np.float32)
 
     # ------------------------------------------------------------------
+    def tune(
+        self,
+        residuals: np.ndarray,
+        n_trials: int = 20,
+        val_frac: float = 0.15,
+        epochs_per_trial: int = 30,
+        patience_per_trial: int = 5,
+        verbose: bool = True,
+    ) -> Dict:
+        """
+        Run Optuna hyperparameter search.
+
+        Searches over:
+          hidden_size  : [32, 64, 96, 128]
+          num_layers   : [1, 2, 3]
+          dropout      : [0.1, 0.5]
+          lr           : [1e-4, 1e-2]  log scale
+          batch_size   : [32, 64, 128]
+          input_window : [30, 45, 60, 90]
+
+        Returns best_params dict.
+        Updates self.input_window and rebuilds self._net with best params
+        so that fit() can be called immediately after.
+        """
+        try:
+            import optuna
+            import torch
+            from torch.utils.data import DataLoader, TensorDataset
+        except ImportError:
+            raise ImportError("Install with: pip install optuna torch")
+
+        # Silence Optuna's per-trial output unless verbose
+        if not verbose:
+            optuna.logging.set_verbosity(optuna.logging.WARNING)
+        else:
+            optuna.logging.set_verbosity(optuna.logging.INFO)
+
+        scaler_mean = float(np.mean(residuals))
+        scaler_std = float(np.std(residuals)) or 1.0
+        scaled = (residuals - scaler_mean) / scaler_std
+
+        def objective(trial: optuna.Trial) -> float:
+            h_size = trial.suggest_categorical(
+                "hidden_size", [32, 64, 96, 128]
+            )
+            n_layers = trial.suggest_int("num_layers", 1, 3)
+            drop = trial.suggest_float("dropout", 0.1, 0.5)
+            lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
+            b_size = trial.suggest_categorical("batch_size", [32, 64, 128])
+            i_win = trial.suggest_categorical(
+                "input_window", [30, 45, 60, 90]
+            )
+
+            X, Y = self._make_sequences(scaled, i_win)
+            if len(X) < 10:
+                return float("inf")
+
+            n_val = max(1, int(len(X) * val_frac))
+            X_tr, Y_tr = X[:-n_val], Y[:-n_val]
+            X_val, Y_val = X[-n_val:], Y[-n_val:]
+
+            X_tr_t = torch.tensor(X_tr[:, :, None]).to(self._device)
+            Y_tr_t = torch.tensor(Y_tr).to(self._device)
+            X_val_t = torch.tensor(X_val[:, :, None]).to(self._device)
+            Y_val_t = torch.tensor(Y_val).to(self._device)
+
+            net = _build_net(
+                h_size, n_layers, drop, self.n_quantiles, self.horizon
+            ).to(self._device)
+            optim = torch.optim.Adam(net.parameters(), lr=lr)
+
+            ds = TensorDataset(X_tr_t, Y_tr_t)
+            loader = DataLoader(ds, batch_size=b_size, shuffle=True)
+
+            best_val = math.inf
+            patience_counter = 0
+
+            for epoch in range(epochs_per_trial):
+                net.train()
+                for xb, yb in loader:
+                    optim.zero_grad()
+                    preds = net(xb)
+                    loss = self._pinball_loss_torch(
+                        preds, yb.unsqueeze(1).expand_as(preds)
+                    )
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+                    optim.step()
+
+                net.eval()
+                with torch.no_grad():
+                    val_preds = net(X_val_t)
+                    val_loss = self._pinball_loss_torch(
+                        val_preds,
+                        Y_val_t.unsqueeze(1).expand_as(val_preds),
+                    )
+                vl = float(val_loss.item())
+
+                # Optuna pruning
+                trial.report(vl, epoch)
+                if trial.should_prune():
+                    raise optuna.exceptions.TrialPruned()
+
+                if vl < best_val:
+                    best_val = vl
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= patience_per_trial:
+                        break
+
+            return best_val
+
+        study = optuna.create_study(
+            direction="minimize",
+            sampler=optuna.samplers.TPESampler(seed=42),
+            pruner=optuna.pruners.MedianPruner(n_startup_trials=5),
+        )
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=verbose)
+
+        best = study.best_params
+        self.best_params = best
+        logger.info("Optuna best params: %s", best)
+        logger.info("Optuna best val pinball: %.5f", study.best_value)
+
+        # Rebuild model with best params
+        self.input_window = best["input_window"]
+        self.hidden_size = best["hidden_size"]
+        self.num_layers = best["num_layers"]
+        self.dropout = best["dropout"]
+        self._net = _build_net(
+            self.hidden_size,
+            self.num_layers,
+            self.dropout,
+            self.n_quantiles,
+            self.horizon,
+        ).to(self._device)
+
+        return best
+
+    # ------------------------------------------------------------------
     def fit(
         self,
         residuals: np.ndarray,
         epochs: int = 100,
-        lr: float = 1e-3,
-        batch_size: int = 64,
+        lr: float = DEFAULT_LR,
+        batch_size: int = DEFAULT_BATCH_SIZE,
         val_frac: float = 0.15,
         patience: int = 10,
         gap_threshold: float = GAP_THRESHOLD,
         verbose: bool = True,
     ) -> Tuple[List[float], List[float]]:
         """
-        Train the LSTM on residuals.
+        Train on residuals using current hyperparameters.
+        Call tune() first for Optuna-optimised params, or use defaults.
 
-        Returns
-        -------
-        (train_losses, val_losses) — one value per epoch actually run.
-        Early stopping fires when:
-          (a) val loss does not improve for `patience` consecutive epochs, OR
-          (b) (val_loss - train_loss) > gap_threshold  (overfitting detected)
+        Returns (train_losses, val_losses) per epoch.
+        Early stopping on patience AND train/val gap.
         """
         import torch
         from torch.utils.data import DataLoader, TensorDataset
+
+        # Use best lr/batch from Optuna if available
+        if self.best_params:
+            lr = self.best_params.get("lr", lr)
+            batch_size = self.best_params.get("batch_size", batch_size)
 
         self._scaler_mean = float(np.mean(residuals))
         self._scaler_std = float(np.std(residuals)) or 1.0
         scaled = (residuals - self._scaler_mean) / self._scaler_std
 
-        X, Y = self._make_sequences(scaled)
+        X, Y = self._make_sequences(scaled, self.input_window)
         n_val = max(1, int(len(X) * val_frac))
         X_tr, Y_tr = X[:-n_val], Y[:-n_val]
         X_val, Y_val = X[-n_val:], Y[-n_val:]
 
-        # Store for SHAP / LIME
         self._X_train = X_tr.copy()
         self._X_val = X_val.copy()
 
@@ -399,14 +565,12 @@ class _QuantileLSTMModel:
         best_state = None
 
         for epoch in range(1, epochs + 1):
-
-            # --- Training pass
             self._net.train()
             batch_losses = []
             for xb, yb in loader:
                 optim.zero_grad()
                 preds = self._net(xb)
-                loss = self._pinball_loss(
+                loss = self._pinball_loss_torch(
                     preds, yb.unsqueeze(1).expand_as(preds)
                 )
                 loss.backward()
@@ -416,11 +580,10 @@ class _QuantileLSTMModel:
             train_loss = float(np.mean(batch_losses))
             self.train_losses.append(train_loss)
 
-            # --- Validation pass
             self._net.eval()
             with torch.no_grad():
                 val_preds = self._net(X_val_t)
-                val_loss = self._pinball_loss(
+                val_loss = self._pinball_loss_torch(
                     val_preds, Y_val_t.unsqueeze(1).expand_as(val_preds)
                 )
             vl = float(val_loss.item())
@@ -434,26 +597,25 @@ class _QuantileLSTMModel:
                     epoch, epochs, train_loss, vl, gap,
                 )
 
-            # --- Early stopping: patience
             if vl < best_val:
                 best_val = vl
                 patience_counter = 0
                 best_state = {
-                    k: v.clone() for k, v in self._net.state_dict().items()
+                    k: v.clone()
+                    for k, v in self._net.state_dict().items()
                 }
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
                     logger.info(
-                        "Early stop (patience=%d) at epoch %d  val=%.5f",
-                        patience, epoch, vl,
+                        "Early stop (patience=%d) at epoch %d",
+                        patience, epoch,
                     )
                     break
 
-            # --- Early stopping: overfitting gap
             if gap > gap_threshold:
                 logger.info(
-                    "Early stop (gap=%.4f > threshold=%.4f) at epoch %d",
+                    "Early stop (gap=%.4f > %.4f) at epoch %d",
                     gap, gap_threshold, epoch,
                 )
                 break
@@ -476,8 +638,7 @@ class _QuantileLSTMModel:
         self._net.eval()
         with torch.no_grad():
             out = self._net(x)
-        out_np = out.squeeze(0).cpu().numpy()
-        return out_np * self._scaler_std + self._scaler_mean
+        return out.squeeze(0).cpu().numpy() * self._scaler_std + self._scaler_mean
 
     # ------------------------------------------------------------------
     def compute_shap(
@@ -485,68 +646,51 @@ class _QuantileLSTMModel:
         n_background: int = 100,
         n_explain: int = 50,
     ) -> np.ndarray:
-        """
-        Compute SHAP values using DeepExplainer on the validation set.
-
-        Returns
-        -------
-        shap_mean_abs : np.ndarray of shape (INPUT_WINDOW,)
-            Mean absolute SHAP value per input lag, averaged over
-            all quantiles and forecast steps. Higher = more important lag.
-
-        Also stores:
-            self.shap_values : raw array (n_explain, INPUT_WINDOW, n_quantiles*horizon)
-        """
         if not self._is_trained:
             raise RuntimeError("Call .fit() before compute_shap().")
         if self._X_train is None or self._X_val is None:
             raise RuntimeError("No training data stored — retrain the model.")
-
         try:
             import shap
             import torch
         except ImportError:
             raise ImportError("Install with: pip install shap")
 
-        # Background: random sample from training set
         n_bg = min(n_background, len(self._X_train))
         idx_bg = np.random.choice(len(self._X_train), n_bg, replace=False)
         background = torch.tensor(
             self._X_train[idx_bg, :, None], dtype=torch.float32
         ).to(self._device)
 
-        # Samples to explain: last n_explain from val set
         n_exp = min(n_explain, len(self._X_val))
         X_exp = torch.tensor(
             self._X_val[-n_exp:, :, None], dtype=torch.float32
         ).to(self._device)
 
-        # Flatten LSTM output for SHAP (it expects 2D output)
-        class _FlatNet(torch.nn.Module):
+        import torch.nn as nn
+
+        class _FlatNet(nn.Module):
             def __init__(self, net):
                 super().__init__()
                 self.net = net
 
             def forward(self, x):
                 out = self.net(x)
-                return out.view(out.shape[0], -1)  # (B, nq*H)
+                return out.view(out.shape[0], -1)
 
         flat_net = _FlatNet(self._net).to(self._device)
         flat_net.eval()
 
         explainer = shap.DeepExplainer(flat_net, background)
         shap_vals = explainer.shap_values(X_exp)
-        # shap_vals: list of (n_exp, T, 1) per output — length nq*H
-        # Stack to (n_exp, T, nq*H) then squeeze feature dim
         stacked = np.stack(
             [sv[:, :, 0] for sv in shap_vals], axis=-1
-        )  # (n_exp, T, nq*H)
-
+        )
         self.shap_values = stacked
-        shap_mean_abs = np.mean(np.abs(stacked), axis=(0, 2))  # (T,)
+        shap_mean_abs = np.mean(np.abs(stacked), axis=(0, 2))
         self.shap_importance = shap_mean_abs
         logger.info(
-            "SHAP computed. Top-3 lags: %s",
+            "SHAP top-3 lags: %s",
             np.argsort(shap_mean_abs)[::-1][:3].tolist(),
         )
         return shap_mean_abs
@@ -559,27 +703,10 @@ class _QuantileLSTMModel:
         horizon_idx: int = 0,
         num_features: int = 10,
     ) -> object:
-        """
-        Explain a single forecast using LIME.
-
-        Parameters
-        ----------
-        last_residuals : np.ndarray shape (INPUT_WINDOW,)
-            The input window to explain.
-        quantile_idx   : which quantile head to explain (0=Q10 ... 4=Q90)
-        horizon_idx    : which forecast step to explain (0=day1 ... 14=day15)
-        num_features   : number of top features LIME reports
-
-        Returns
-        -------
-        lime Explanation object — call .as_list() for feature contributions,
-        or .show_in_notebook() if in Jupyter.
-        """
         if not self._is_trained:
             raise RuntimeError("Call .fit() before explain_forecast_lime().")
         if self._X_train is None:
             raise RuntimeError("No training data stored — retrain the model.")
-
         try:
             import torch
             from lime import lime_tabular
@@ -589,13 +716,14 @@ class _QuantileLSTMModel:
         output_idx = quantile_idx * self.horizon + horizon_idx
 
         def _predict_fn(X_flat: np.ndarray) -> np.ndarray:
-            """Wrapper: flat (N, T) -> scalar output at [quantile, horizon]."""
-            X_3d = X_flat.reshape(-1, self.input_window, 1).astype(np.float32)
+            X_3d = X_flat.reshape(
+                -1, self.input_window, 1
+            ).astype(np.float32)
             t = torch.tensor(X_3d).to(self._device)
             self._net.eval()
             with torch.no_grad():
-                out = self._net(t)          # (N, nq, H)
-                flat = out.view(out.shape[0], -1)  # (N, nq*H)
+                out = self._net(t)
+                flat = out.view(out.shape[0], -1)
             return flat[:, output_idx].cpu().numpy()
 
         feature_names = [f"lag_{i+1}d" for i in range(self.input_window)]
@@ -610,19 +738,13 @@ class _QuantileLSTMModel:
         scaled_input = (
             (last_residuals - self._scaler_mean) / self._scaler_std
         )
-
         explanation = explainer.explain_instance(
             scaled_input,
             _predict_fn,
             num_features=num_features,
         )
-
-        q_label = QUANTILE_LABELS[quantile_idx]
         logger.info(
-            "LIME explanation for %s day+%d: top feature = %s",
-            q_label,
-            horizon_idx + 1,
-            explanation.as_list()[0][0],
+            "LIME top feature: %s", explanation.as_list()[0][0]
         )
         return explanation
 
@@ -636,6 +758,11 @@ class _QuantileLSTMModel:
                 "scaler_std": self._scaler_std,
                 "train_losses": self.train_losses,
                 "val_losses": self.val_losses,
+                "best_params": self.best_params,
+                "input_window": self.input_window,
+                "hidden_size": self.hidden_size,
+                "num_layers": self.num_layers,
+                "dropout": self.dropout,
             },
             path,
         )
@@ -644,11 +771,23 @@ class _QuantileLSTMModel:
     def load(self, path: Path) -> None:
         import torch
         ckpt = torch.load(path, map_location=self._device)
+        self.input_window = ckpt.get("input_window", DEFAULT_INPUT_WINDOW)
+        self.hidden_size = ckpt.get("hidden_size", DEFAULT_HIDDEN_SIZE)
+        self.num_layers = ckpt.get("num_layers", DEFAULT_NUM_LAYERS)
+        self.dropout = ckpt.get("dropout", DEFAULT_DROPOUT)
+        self._net = _build_net(
+            self.hidden_size,
+            self.num_layers,
+            self.dropout,
+            self.n_quantiles,
+            self.horizon,
+        ).to(self._device)
         self._net.load_state_dict(ckpt["state_dict"])
         self._scaler_mean = ckpt["scaler_mean"]
         self._scaler_std = ckpt["scaler_std"]
         self.train_losses = ckpt.get("train_losses", [])
         self.val_losses = ckpt.get("val_losses", [])
+        self.best_params = ckpt.get("best_params", {})
         self._is_trained = True
         logger.info("LSTM loaded <- %s", path)
 
@@ -761,7 +900,8 @@ class Forecaster:
         )
         if sub.empty:
             raise ValueError(
-                f"No data found for site='{site}', variable='{self.variable}'."
+                f"No data found for site='{site}', "
+                f"variable='{self.variable}'."
             )
         return sub[self._col].asfreq("D").interpolate("linear")
 
@@ -778,8 +918,7 @@ class Forecaster:
             series = self._get_site_series(site)
             dc = SignalDecomposer().fit(series)
             self._decomposers[site] = dc
-            eq = EmpiricalQuantileForecaster(dc).fit()
-            self._emp_forecasters[site] = eq
+            self._emp_forecasters[site] = EmpiricalQuantileForecaster(dc).fit()
             self._persistence_forecasters[site] = PersistenceForecaster(dc)
             logger.info(
                 "Empirical forecaster fitted for %s (%d days).",
@@ -789,12 +928,61 @@ class Forecaster:
         self._empirical_fitted = True
         return self
 
+    def tune_lstm(
+        self,
+        site: str,
+        n_trials: int = 20,
+        val_frac: float = 0.15,
+        epochs_per_trial: int = 30,
+        patience_per_trial: int = 5,
+        verbose: bool = True,
+        force_retune: bool = False,
+    ) -> Dict:
+        """
+        Run Optuna search for one site. Must call fit_empirical() first.
+        Returns best_params dict.
+        Call fit_lstm() immediately after to train with best params.
+        """
+        if not self._empirical_fitted:
+            raise RuntimeError("Call fit_empirical() before tune_lstm().")
+
+        params_path = (
+            self._model_dir
+            / f"optuna_{self.variable}_{site.replace(' ', '_')}.npy"
+        )
+
+        model = _QuantileLSTMModel()
+
+        if params_path.exists() and not force_retune:
+            best_params = dict(np.load(params_path, allow_pickle=True).item())
+            logger.info(
+                "Loaded existing Optuna params for %s: %s", site, best_params
+            )
+            model.best_params = best_params
+            model.input_window = best_params["input_window"]
+            model.hidden_size = best_params["hidden_size"]
+            model.num_layers = best_params["num_layers"]
+            model.dropout = best_params["dropout"]
+            self._lstm_models[site] = model
+            return best_params
+
+        residuals = self._decomposers[site].residuals.values
+        best_params = model.tune(
+            residuals,
+            n_trials=n_trials,
+            val_frac=val_frac,
+            epochs_per_trial=epochs_per_trial,
+            patience_per_trial=patience_per_trial,
+            verbose=verbose,
+        )
+        np.save(params_path, best_params)
+        self._lstm_models[site] = model
+        return best_params
+
     def fit_lstm(
         self,
         site: str,
         epochs: int = 100,
-        lr: float = 1e-3,
-        batch_size: int = 64,
         val_frac: float = 0.15,
         patience: int = 10,
         gap_threshold: float = GAP_THRESHOLD,
@@ -803,26 +991,28 @@ class Forecaster:
     ) -> Tuple[List[float], List[float]]:
         """
         Train LSTM for one site.
+        If tune_lstm() was called first, uses Optuna best params.
+        Otherwise uses defaults.
 
-        Returns
-        -------
-        (train_losses, val_losses) per epoch.
+        Returns (train_losses, val_losses) per epoch.
         """
         if not self._empirical_fitted:
             raise RuntimeError("Call fit_empirical() before fit_lstm().")
-        if site not in self._decomposers:
-            raise ValueError(f"Site '{site}' not fitted empirically yet.")
 
         model_path = (
             self._model_dir
             / f"lstm_{self.variable}_{site.replace(' ', '_')}.pt"
         )
-        model = _QuantileLSTMModel()
+
+        # Reuse existing model object from tune_lstm if available
+        if site not in self._lstm_models:
+            self._lstm_models[site] = _QuantileLSTMModel()
+
+        model = self._lstm_models[site]
 
         if model_path.exists() and not force_retrain:
             logger.info("Loading existing LSTM from %s", model_path)
             model.load(model_path)
-            self._lstm_models[site] = model
             if site not in self._lstm_fitted_sites:
                 self._lstm_fitted_sites.append(site)
             return model.train_losses, model.val_losses
@@ -837,15 +1027,12 @@ class Forecaster:
         train_losses, val_losses = model.fit(
             residuals,
             epochs=epochs,
-            lr=lr,
-            batch_size=batch_size,
             val_frac=val_frac,
             patience=patience,
             gap_threshold=gap_threshold,
             verbose=verbose,
         )
         model.save(model_path)
-        self._lstm_models[site] = model
         if site not in self._lstm_fitted_sites:
             self._lstm_fitted_sites.append(site)
         return train_losses, val_losses
@@ -856,7 +1043,6 @@ class Forecaster:
         n_background: int = 100,
         n_explain: int = 50,
     ) -> np.ndarray:
-        """Return mean absolute SHAP values per input lag for one site."""
         if site not in self._lstm_models:
             raise RuntimeError(f"Train LSTM for '{site}' first.")
         return self._lstm_models[site].compute_shap(n_background, n_explain)
@@ -869,16 +1055,16 @@ class Forecaster:
         horizon_idx: int = 0,
         num_features: int = 10,
     ) -> object:
-        """Return LIME explanation for one forecast from one site."""
         if site not in self._lstm_models:
             raise RuntimeError(f"Train LSTM for '{site}' first.")
         series = self._get_site_series(site)
         if anchor_date is None:
             anchor_date = series.index[-1]
         resid = self._decomposers[site].residuals
-        context = resid[resid.index <= anchor_date].values[-INPUT_WINDOW:]
-        if len(context) < INPUT_WINDOW:
-            pad = np.zeros(INPUT_WINDOW - len(context))
+        context = resid[resid.index <= anchor_date].values[-self._lstm_models[site].input_window:]
+        iw = self._lstm_models[site].input_window
+        if len(context) < iw:
+            pad = np.zeros(iw - len(context))
             context = np.concatenate([pad, context])
         return self._lstm_models[site].explain_forecast_lime(
             context, quantile_idx, horizon_idx, num_features
@@ -891,13 +1077,15 @@ class Forecaster:
         anchor_date: Optional[pd.Timestamp] = None,
     ) -> pd.DataFrame:
         if not self._empirical_fitted or site not in self._emp_forecasters:
-            raise RuntimeError(f"fit_empirical() not yet run for site '{site}'.")
+            raise RuntimeError(
+                f"fit_empirical() not yet run for site '{site}'."
+            )
         if anchor_date is None:
             anchor_date = self._get_site_series(site).index[-1]
         fan = self._emp_forecasters[site].forecast(anchor_date, n_days=n_days)
-        fan.attrs["site"] = site
-        fan.attrs["variable"] = self.variable
-        fan.attrs["method"] = "empirical"
+        fan.attrs.update(
+            {"site": site, "variable": self.variable, "method": "empirical"}
+        )
         return fan
 
     def forecast_persistence(
@@ -907,15 +1095,17 @@ class Forecaster:
         anchor_date: Optional[pd.Timestamp] = None,
     ) -> pd.DataFrame:
         if site not in self._persistence_forecasters:
-            raise RuntimeError(f"fit_empirical() not yet run for site '{site}'.")
+            raise RuntimeError(
+                f"fit_empirical() not yet run for site '{site}'."
+            )
         if anchor_date is None:
             anchor_date = self._get_site_series(site).index[-1]
         fan = self._persistence_forecasters[site].forecast(
             anchor_date, n_days=n_days
         )
-        fan.attrs["site"] = site
-        fan.attrs["variable"] = self.variable
-        fan.attrs["method"] = "persistence"
+        fan.attrs.update(
+            {"site": site, "variable": self.variable, "method": "persistence"}
+        )
         return fan
 
     def forecast_lstm(
@@ -924,9 +1114,9 @@ class Forecaster:
         n_days: int = FORECAST_HORIZON,
         anchor_date: Optional[pd.Timestamp] = None,
     ) -> pd.DataFrame:
-        if site not in self._lstm_models:
+        if site not in self._lstm_models or not self._lstm_models[site]._is_trained:
             raise RuntimeError(
-                f"LSTM not trained for site '{site}'. "
+                f"LSTM not trained for '{site}'. "
                 f"Call fit_lstm('{site}') first."
             )
 
@@ -938,9 +1128,10 @@ class Forecaster:
             anchor_date = series.index[-1]
 
         resid = dc.residuals
-        context = resid[resid.index <= anchor_date].values[-INPUT_WINDOW:]
-        if len(context) < INPUT_WINDOW:
-            pad = np.zeros(INPUT_WINDOW - len(context))
+        iw = model.input_window
+        context = resid[resid.index <= anchor_date].values[-iw:]
+        if len(context) < iw:
+            pad = np.zeros(iw - len(context))
             context = np.concatenate([pad, context])
 
         lstm_resid = model.predict(context)
@@ -968,9 +1159,9 @@ class Forecaster:
             rows.append(row)
 
         fan = pd.DataFrame(rows).set_index("date").clip(lower=0.0)
-        fan.attrs["site"] = site
-        fan.attrs["variable"] = self.variable
-        fan.attrs["method"] = "lstm"
+        fan.attrs.update(
+            {"site": site, "variable": self.variable, "method": "lstm"}
+        )
         return fan
 
     def forecast(
@@ -980,9 +1171,16 @@ class Forecaster:
         anchor_date: Optional[pd.Timestamp] = None,
     ) -> pd.DataFrame:
         """Auto-select: LSTM if trained, else empirical."""
-        if site in self._lstm_models:
-            return self.forecast_lstm(site, n_days=n_days, anchor_date=anchor_date)
-        return self.forecast_empirical(site, n_days=n_days, anchor_date=anchor_date)
+        if (
+            site in self._lstm_models
+            and self._lstm_models[site]._is_trained
+        ):
+            return self.forecast_lstm(
+                site, n_days=n_days, anchor_date=anchor_date
+            )
+        return self.forecast_empirical(
+            site, n_days=n_days, anchor_date=anchor_date
+        )
 
     def evaluate(
         self,
@@ -991,13 +1189,17 @@ class Forecaster:
         test_days: int = 90,
     ) -> pd.DataFrame:
         """
-        Walk-forward pinball loss evaluation on last test_days of data.
-
+        Walk-forward pinball loss on last test_days of data.
         method : "empirical" | "lstm" | "persistence"
         """
         series = self._get_site_series(site)
         n = len(series)
-        if n < INPUT_WINDOW + test_days + 1:
+        iw = (
+            self._lstm_models[site].input_window
+            if site in self._lstm_models
+            else DEFAULT_INPUT_WINDOW
+        )
+        if n < iw + test_days + 1:
             raise ValueError("Not enough data for evaluation.")
 
         cut_idx = n - test_days
@@ -1014,7 +1216,9 @@ class Forecaster:
                     site, n_days=1, anchor_date=anchor
                 )
             else:
-                fan = self.forecast_empirical(site, n_days=1, anchor_date=anchor)
+                fan = self.forecast_empirical(
+                    site, n_days=1, anchor_date=anchor
+                )
 
             for q, lbl in zip(QUANTILES, QUANTILE_LABELS):
                 pred = float(fan.iloc[0][lbl])
@@ -1039,30 +1243,34 @@ class Forecaster:
         test_days: int = 90,
     ) -> pd.DataFrame:
         """
-        Run walk-forward evaluation for all three methods and return a
-        summary table of mean pinball loss per quantile per method.
-
-        Useful for the IEEE paper results section.
+        Mean pinball loss per quantile per method.
+        Produces the results table for the IEEE paper.
         """
         methods = ["persistence", "empirical"]
-        if site in self._lstm_models:
+        if site in self._lstm_models and self._lstm_models[site]._is_trained:
             methods.append("lstm")
 
         rows = []
         for method in methods:
-            eval_df = self.evaluate(site, method=method, test_days=test_days)
+            eval_df = self.evaluate(
+                site, method=method, test_days=test_days
+            )
             for lbl, grp in eval_df.groupby("label"):
                 rows.append(
                     {
                         "method": method,
                         "quantile": lbl,
-                        "mean_pinball": round(grp["pinball_loss"].mean(), 6),
+                        "mean_pinball": round(
+                            grp["pinball_loss"].mean(), 6
+                        ),
                     }
                 )
 
         return (
             pd.DataFrame(rows)
-            .pivot(index="quantile", columns="method", values="mean_pinball")
+            .pivot(
+                index="quantile", columns="method", values="mean_pinball"
+            )
             .reset_index()
         )
 
@@ -1101,7 +1309,6 @@ def build_forecasters(
 ) -> Dict[str, "Forecaster"]:
     """
     Build and optionally fit empirical forecasters for solar and wind.
-
     Returns dict with keys "solar" and "wind".
     """
     forecasters: Dict[str, Forecaster] = {}
@@ -1114,14 +1321,12 @@ def build_forecasters(
 
 
 # ---------------------------------------------------------------------------
-# ForecastBundle — joint solar + wind fan with correlated quantiles
+# ForecastBundle
 # ---------------------------------------------------------------------------
 
 class ForecastBundle:
     """
-    Joint operational forecast for one site.
-    Attaches seasonal solar-wind correlation coefficient (rho) to each
-    forecast row so diesel_model.py can propagate joint worst-case quantiles.
+    Joint operational forecast for one site with solar-wind correlation.
     """
 
     def __init__(
@@ -1146,14 +1351,11 @@ class ForecastBundle:
         wnd_fan = self._wf.forecast(
             site, n_days=n_days, anchor_date=anchor_date
         )
-
         sol_fan.columns = [f"solar_{c}" for c in sol_fan.columns]
         wnd_fan.columns = [f"wind_{c}" for c in wnd_fan.columns]
-
         bundle = sol_fan.join(wnd_fan)
         bundle["rho"] = [
             self._corr.get(site, dt.month) for dt in bundle.index
         ]
-        bundle.attrs["site"] = site
-        bundle.attrs["n_days"] = n_days
+        bundle.attrs.update({"site": site, "n_days": n_days})
         return bundle

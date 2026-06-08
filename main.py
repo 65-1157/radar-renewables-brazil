@@ -11,15 +11,12 @@ Subcommands
 
 Usage
 -----
-  cd ~/Desktop/projects/radar-renewables-brazil
-  source .venv/bin/activate
-
   python main.py run-pipeline
   python main.py run-scenarios
   python main.py run-forecast --site "Natal" --variable solar
-  python main.py run-forecast --site "Ilha da Trindade" --variable wind --days 15
   python main.py run-forecast --site "Natal" --variable solar --lstm --epochs 50
-  python main.py run-forecast --site "Natal" --variable solar --lstm --evaluate
+  python main.py run-forecast --site "Natal" --variable solar --lstm --tune --n-trials 20
+  python main.py run-forecast --site "Natal" --variable solar --lstm --tune --evaluate
 """
 
 from __future__ import annotations
@@ -29,32 +26,23 @@ from pathlib import Path
 from typing import Optional
 
 
-# ---------------------------------------------------------------------------
-# Sub-command handlers
-# ---------------------------------------------------------------------------
-
 def cmd_pipeline(args: argparse.Namespace) -> None:
-    """Load data, run quality filter, print site summary."""
     from src.nasa_loader import (
         load_params, load_combined_csv, quality_filter,
         gap_fill, add_hub_height_wind, split_by_site, summarise_all,
     )
-
     params = load_params(args.config)
     df = load_combined_csv(params)
     df = quality_filter(df)
     df = gap_fill(df)
     df = add_hub_height_wind(df, params)
     all_data = split_by_site(df)
-
     print("\n=== Site data summary ===")
-    summary = summarise_all(all_data)
-    print(summary.to_string(index=False))
+    print(summarise_all(all_data).to_string(index=False))
     print(f"\nTotal rows: {len(df)}")
 
 
 def cmd_scenarios(args: argparse.Namespace) -> None:
-    """Run full scenario sweep and save CSVs to outputs/."""
     from src.scenario_runner import run_all
     run_all(
         config_path=args.config,
@@ -65,10 +53,6 @@ def cmd_scenarios(args: argparse.Namespace) -> None:
 
 
 def cmd_forecast(args: argparse.Namespace) -> None:
-    """
-    Run probabilistic 15-day forecast for one site and variable.
-    Prints the fan chart table and saves to outputs/forecast_<site>_<var>.csv
-    """
     from src.nasa_loader import (
         load_params, load_combined_csv, quality_filter,
         gap_fill, add_hub_height_wind,
@@ -91,23 +75,41 @@ def cmd_forecast(args: argparse.Namespace) -> None:
 
     if args.lstm:
         try:
+            if args.tune:
+                print(
+                    f"Running Optuna search "
+                    f"({args.n_trials} trials)..."
+                )
+                best = fcast.tune_lstm(
+                    site=site,
+                    n_trials=args.n_trials,
+                    verbose=True,
+                    force_retune=args.retrain,
+                )
+                print(f"Best params: {best}")
+
             print(f"Training LSTM (epochs={args.epochs})...")
-            val_losses = fcast.fit_lstm(
+            train_losses, val_losses = fcast.fit_lstm(
                 site=site,
                 epochs=args.epochs,
                 verbose=True,
                 force_retrain=args.retrain,
             )
             if val_losses:
-                print(f"Final val pinball loss: {val_losses[-1]:.5f}")
-        except ImportError:
-            print(
-                "WARNING: PyTorch not installed — falling back to empirical.\n"
-                "Install with: pip install torch"
-            )
+                print(
+                    f"Final train={train_losses[-1]:.5f}  "
+                    f"val={val_losses[-1]:.5f}  "
+                    f"gap={val_losses[-1]-train_losses[-1]:.5f}"
+                )
+
+                # Save train/val loss plot
+                from src.visualiser import plot_train_val_loss
+                plot_train_val_loss(train_losses, val_losses, site, variable)
+
+        except ImportError as e:
+            print(f"WARNING: {e} — falling back to empirical.")
 
     fan = fcast.forecast(site=site, n_days=n_days)
-
     print(f"\n=== {n_days}-day forecast: {site} / {variable} ===")
     print(fan.to_string())
 
@@ -120,23 +122,29 @@ def cmd_forecast(args: argparse.Namespace) -> None:
 
     if args.evaluate:
         print("\nRunning walk-forward evaluation (last 90 days)...")
-        method = (
-            "lstm"
-            if args.lstm and site in fcast._lstm_fitted_sites
-            else "empirical"
+        comp = fcast.compare_methods(site=site, test_days=90)
+        print("\nMean pinball loss — method comparison:")
+        print(comp.to_string(index=False))
+        comp_path = out_dir / f"compare_{safe_site}_{variable}.csv"
+        comp.to_csv(comp_path, index=False)
+        print(f"Saved -> {comp_path}")
+
+    if args.shap and args.lstm:
+        print("\nComputing SHAP importance...")
+        importance = fcast.compute_shap(site=site)
+        from src.visualiser import plot_shap_importance
+        plot_shap_importance(importance, site, variable)
+        print("SHAP plot saved.")
+
+    if args.lime and args.lstm:
+        print("\nComputing LIME explanation for last forecast, Q50, day+1...")
+        exp = fcast.explain_forecast_lime(
+            site=site, quantile_idx=2, horizon_idx=0
         )
-        eval_df = fcast.evaluate(site=site, method=method, test_days=90)
-        mean_loss = eval_df.groupby("label")["pinball_loss"].mean()
-        print("\nMean pinball loss by quantile:")
-        print(mean_loss.to_string())
-        eval_path = out_dir / f"eval_{safe_site}_{variable}.csv"
-        eval_df.to_csv(eval_path, index=False)
-        print(f"Saved -> {eval_path}")
+        print("LIME top-10 features:")
+        for feat, weight in exp.as_list():
+            print(f"  {feat:20s}  {weight:+.5f}")
 
-
-# ---------------------------------------------------------------------------
-# Argument parser
-# ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -144,101 +152,74 @@ def build_parser() -> argparse.ArgumentParser:
         description="Radar Renewables Brazil — feasibility & forecasting toolkit",
     )
     parser.add_argument(
-        "--config",
-        default="config/parameters.yaml",
-        help="Path to parameters.yaml (default: config/parameters.yaml)",
+        "--config", default="config/parameters.yaml",
+        help="Path to parameters.yaml",
     )
     parser.add_argument(
-        "--sites",
-        default="config/sites.yaml",
-        help="Path to sites.yaml (default: config/sites.yaml)",
+        "--sites", default="config/sites.yaml",
+        help="Path to sites.yaml",
     )
 
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
     sub.required = True
 
-    # -- run-pipeline -------------------------------------------------------
-    sub.add_parser(
-        "run-pipeline",
-        help="Load NASA POWER data and print site summary",
-    )
+    sub.add_parser("run-pipeline", help="Load data and print site summary")
 
-    # -- run-scenarios ------------------------------------------------------
-    p_scen = sub.add_parser(
-        "run-scenarios",
-        help="Full solar/wind/diesel/economics scenario sweep",
-    )
-    p_scen.add_argument(
-        "--no-save",
-        action="store_true",
-        help="Print results without saving CSVs",
-    )
+    p_scen = sub.add_parser("run-scenarios", help="Full scenario sweep")
+    p_scen.add_argument("--no-save", action="store_true")
 
-    # -- run-forecast -------------------------------------------------------
-    p_fc = sub.add_parser(
-        "run-forecast",
-        help="Probabilistic 15-day fan chart for one site",
-    )
+    p_fc = sub.add_parser("run-forecast", help="15-day probabilistic forecast")
     p_fc.add_argument(
-        "--site",
-        required=True,
+        "--site", required=True,
         choices=[
-            "Salvador",
-            "Natal",
-            "Fortaleza",
-            "Cabo Frio",
-            "Ilha Grande",
-            "Ilha da Trindade",
+            "Salvador", "Natal", "Fortaleza",
+            "Cabo Frio", "Ilha Grande", "Ilha da Trindade",
         ],
-        help="Site name",
     )
     p_fc.add_argument(
-        "--variable",
-        required=True,
-        choices=["solar", "wind"],
-        help="Variable to forecast",
+        "--variable", required=True, choices=["solar", "wind"]
     )
     p_fc.add_argument(
-        "--days",
-        type=int,
-        default=15,
-        metavar="N",
-        help="Forecast horizon in days (default: 15)",
+        "--days", type=int, default=15, metavar="N"
     )
     p_fc.add_argument(
-        "--lstm",
-        action="store_true",
-        help="Train/use LSTM model (requires: pip install torch)",
+        "--lstm", action="store_true",
+        help="Train/use LSTM (requires: pip install torch)",
     )
     p_fc.add_argument(
-        "--epochs",
-        type=int,
-        default=100,
-        metavar="N",
-        help="LSTM training epochs (default: 100, used with --lstm)",
+        "--tune", action="store_true",
+        help="Run Optuna search before training (requires --lstm)",
     )
     p_fc.add_argument(
-        "--retrain",
-        action="store_true",
-        help="Force LSTM retraining even if a saved checkpoint exists",
+        "--n-trials", type=int, default=20, metavar="N",
+        help="Number of Optuna trials (default: 20)",
     )
     p_fc.add_argument(
-        "--evaluate",
-        action="store_true",
-        help="Walk-forward pinball-loss evaluation on last 90 days",
+        "--epochs", type=int, default=100, metavar="N"
+    )
+    p_fc.add_argument(
+        "--retrain", action="store_true",
+        help="Force retrain even if checkpoint exists",
+    )
+    p_fc.add_argument(
+        "--evaluate", action="store_true",
+        help="Walk-forward pinball loss + method comparison table",
+    )
+    p_fc.add_argument(
+        "--shap", action="store_true",
+        help="Compute and plot SHAP feature importance (requires --lstm)",
+    )
+    p_fc.add_argument(
+        "--lime", action="store_true",
+        help="Print LIME explanation for last forecast (requires --lstm)",
     )
 
     return parser
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
 def main(argv: Optional[list] = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
-
     dispatch = {
         "run-pipeline": cmd_pipeline,
         "run-scenarios": cmd_scenarios,
