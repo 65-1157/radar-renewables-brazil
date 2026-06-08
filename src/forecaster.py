@@ -16,26 +16,15 @@ Architecture
   Loss      : pinball (quantile regression) loss — one head per quantile
   Input window : 60 days of noise residuals
   Forecast horizon : 15 days ahead
-  Models    : 12 total (6 sites × 2 variables)
+  Models    : 12 total (6 sites x 2 variables)
 
-Usage
------
-  # Phase 1 — empirical quantiles only (no neural net required):
-  fcast = Forecaster(df, variable="solar")
-  fcast.fit_empirical()
-  fan = fcast.forecast_empirical(site="Natal", n_days=15)
-
-  # Phase 2 — LSTM on top:
-  fcast.fit_lstm(site="Natal", epochs=50)
-  fan = fcast.forecast_lstm(site="Natal", n_days=15)
-
-  # Convenience — auto-choose best available model:
-  fan = fcast.forecast(site="Natal", n_days=15)
-
-Requirements
-------------
-  Phase 1 : numpy, pandas, scipy               (always available)
-  Phase 2 : torch (pip install torch)           (optional)
+Improvements in this version
+-----------------------------
+  - Train loss logged alongside val loss every epoch
+  - Early stopping watches both patience AND train/val gap
+  - SHAP (DeepExplainer) computes global feature importance after training
+  - LIME (LimeTabularExplainer) explains individual forecasts locally
+  - Persistence baseline for comparison against LSTM
 
 Python 3.9 compatible — uses Optional[X] not X | Y.
 """
@@ -73,6 +62,7 @@ TREND_WINDOW: int = 365
 INPUT_WINDOW: int = 60
 FORECAST_HORIZON: int = 15
 MIN_TRAIN_DAYS: int = 730
+GAP_THRESHOLD: float = 0.05  # max tolerated train/val pinball gap
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +116,9 @@ class SignalDecomposer:
 
         seasonal_vals = np.array([self._seasonal_profile[d] for d in doy])
         residual = detrended - seasonal_vals
-        self._residual = pd.Series(residual.values, index=series.index, name="residual")
+        self._residual = pd.Series(
+            residual.values, index=series.index, name="residual"
+        )
 
         self._is_fitted = True
         return self
@@ -203,12 +195,54 @@ class EmpiricalQuantileForecaster:
         for i, doy in enumerate(doys):
             base = trend[i] + seasonal[i]
             q_dict = self._doy_quantiles[doy]
-            row = {lbl: base + q_dict[q] for q, lbl in zip(QUANTILES, QUANTILE_LABELS)}
+            row = {
+                lbl: base + q_dict[q]
+                for q, lbl in zip(QUANTILES, QUANTILE_LABELS)
+            }
             row["date"] = future_dates[i]
             rows.append(row)
 
         df = pd.DataFrame(rows).set_index("date")
         return df.clip(lower=0.0)
+
+
+# ---------------------------------------------------------------------------
+# Persistence baseline
+# ---------------------------------------------------------------------------
+
+class PersistenceForecaster:
+    """
+    Naive baseline: forecast = last observed value repeated for all horizons.
+    Used to benchmark LSTM and empirical models on pinball loss.
+    """
+
+    def __init__(self, decomposer: SignalDecomposer) -> None:
+        self._dc = decomposer
+
+    def forecast(
+        self,
+        anchor_date: pd.Timestamp,
+        n_days: int = FORECAST_HORIZON,
+    ) -> pd.DataFrame:
+        resid = self._dc.residuals
+        last_resid = float(resid[resid.index <= anchor_date].iloc[-1])
+
+        future_dates = pd.date_range(
+            start=anchor_date + pd.Timedelta(days=1), periods=n_days, freq="D"
+        )
+        trend = self._dc.trend_at(future_dates)
+        seasonal = self._dc.seasonal_at(future_dates)
+
+        rows = []
+        for i, dt in enumerate(future_dates):
+            base = trend[i] + seasonal[i] + last_resid
+            base = max(0.0, base)
+            # Persistence has no spread — all quantiles equal the point forecast
+            row = {lbl: base for lbl in QUANTILE_LABELS}
+            row["date"] = dt
+            rows.append(row)
+
+        return pd.DataFrame(rows).set_index("date")
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +258,14 @@ def _try_import_torch() -> bool:
 
 
 class _QuantileLSTMModel:
+    """
+    Multi-quantile LSTM with:
+      - Train + val pinball loss tracked every epoch
+      - Early stopping on val loss (patience) AND train/val gap
+      - SHAP DeepExplainer for global feature importance
+      - LIME LimeTabularExplainer for local per-forecast explanation
+    """
+
     def __init__(
         self,
         input_window: int = INPUT_WINDOW,
@@ -246,7 +288,9 @@ class _QuantileLSTMModel:
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         class _Net(nn.Module):
-            def __init__(self, hidden: int, layers: int, drop: float, nq: int, h: int):
+            def __init__(
+                self, hidden: int, layers: int, drop: float, nq: int, h: int
+            ):
                 super().__init__()
                 self.lstm = nn.LSTM(
                     input_size=1,
@@ -271,6 +315,15 @@ class _QuantileLSTMModel:
         self._scaler_std: float = 1.0
         self._is_trained: bool = False
 
+        # Stored after training for SHAP/LIME
+        self._X_train: Optional[np.ndarray] = None
+        self._X_val: Optional[np.ndarray] = None
+
+        # Training history
+        self.train_losses: List[float] = []
+        self.val_losses: List[float] = []
+
+    # ------------------------------------------------------------------
     def _pinball_loss(self, preds, targets):
         import torch
         total = torch.zeros(1, device=self._device)
@@ -292,6 +345,7 @@ class _QuantileLSTMModel:
             Y.append(residuals[start + T : start + T + H])
         return np.array(X, dtype=np.float32), np.array(Y, dtype=np.float32)
 
+    # ------------------------------------------------------------------
     def fit(
         self,
         residuals: np.ndarray,
@@ -300,8 +354,19 @@ class _QuantileLSTMModel:
         batch_size: int = 64,
         val_frac: float = 0.15,
         patience: int = 10,
+        gap_threshold: float = GAP_THRESHOLD,
         verbose: bool = True,
-    ) -> List[float]:
+    ) -> Tuple[List[float], List[float]]:
+        """
+        Train the LSTM on residuals.
+
+        Returns
+        -------
+        (train_losses, val_losses) — one value per epoch actually run.
+        Early stopping fires when:
+          (a) val loss does not improve for `patience` consecutive epochs, OR
+          (b) (val_loss - train_loss) > gap_threshold  (overfitting detected)
+        """
         import torch
         from torch.utils.data import DataLoader, TensorDataset
 
@@ -314,6 +379,10 @@ class _QuantileLSTMModel:
         X_tr, Y_tr = X[:-n_val], Y[:-n_val]
         X_val, Y_val = X[-n_val:], Y[-n_val:]
 
+        # Store for SHAP / LIME
+        self._X_train = X_tr.copy()
+        self._X_val = X_val.copy()
+
         X_tr_t = torch.tensor(X_tr[:, :, None]).to(self._device)
         Y_tr_t = torch.tensor(Y_tr).to(self._device)
         X_val_t = torch.tensor(X_val[:, :, None]).to(self._device)
@@ -323,21 +392,31 @@ class _QuantileLSTMModel:
         loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
         optim = torch.optim.Adam(self._net.parameters(), lr=lr)
 
-        val_losses: List[float] = []
+        self.train_losses = []
+        self.val_losses = []
         best_val = math.inf
         patience_counter = 0
         best_state = None
 
         for epoch in range(1, epochs + 1):
+
+            # --- Training pass
             self._net.train()
+            batch_losses = []
             for xb, yb in loader:
                 optim.zero_grad()
                 preds = self._net(xb)
-                loss = self._pinball_loss(preds, yb.unsqueeze(1).expand_as(preds))
+                loss = self._pinball_loss(
+                    preds, yb.unsqueeze(1).expand_as(preds)
+                )
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self._net.parameters(), 1.0)
                 optim.step()
+                batch_losses.append(float(loss.item()))
+            train_loss = float(np.mean(batch_losses))
+            self.train_losses.append(train_loss)
 
+            # --- Validation pass
             self._net.eval()
             with torch.no_grad():
                 val_preds = self._net(X_val_t)
@@ -345,39 +424,209 @@ class _QuantileLSTMModel:
                     val_preds, Y_val_t.unsqueeze(1).expand_as(val_preds)
                 )
             vl = float(val_loss.item())
-            val_losses.append(vl)
+            self.val_losses.append(vl)
+
+            gap = vl - train_loss
 
             if verbose and epoch % 10 == 0:
-                logger.info("Epoch %3d/%d  val_pinball=%.5f", epoch, epochs, vl)
+                logger.info(
+                    "Epoch %3d/%d  train=%.5f  val=%.5f  gap=%.5f",
+                    epoch, epochs, train_loss, vl, gap,
+                )
 
+            # --- Early stopping: patience
             if vl < best_val:
                 best_val = vl
                 patience_counter = 0
-                best_state = {k: v.clone() for k, v in self._net.state_dict().items()}
+                best_state = {
+                    k: v.clone() for k, v in self._net.state_dict().items()
+                }
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
-                    logger.info("Early stop at epoch %d (patience=%d)", epoch, patience)
+                    logger.info(
+                        "Early stop (patience=%d) at epoch %d  val=%.5f",
+                        patience, epoch, vl,
+                    )
                     break
+
+            # --- Early stopping: overfitting gap
+            if gap > gap_threshold:
+                logger.info(
+                    "Early stop (gap=%.4f > threshold=%.4f) at epoch %d",
+                    gap, gap_threshold, epoch,
+                )
+                break
 
         if best_state is not None:
             self._net.load_state_dict(best_state)
         self._is_trained = True
-        return val_losses
+        return self.train_losses, self.val_losses
 
+    # ------------------------------------------------------------------
     def predict(self, last_residuals: np.ndarray) -> np.ndarray:
         if not self._is_trained:
             raise RuntimeError("Call .fit() before .predict().")
         import torch
 
         scaled = (last_residuals - self._scaler_mean) / self._scaler_std
-        x = torch.tensor(scaled[None, :, None], dtype=torch.float32).to(self._device)
+        x = torch.tensor(
+            scaled[None, :, None], dtype=torch.float32
+        ).to(self._device)
         self._net.eval()
         with torch.no_grad():
             out = self._net(x)
         out_np = out.squeeze(0).cpu().numpy()
         return out_np * self._scaler_std + self._scaler_mean
 
+    # ------------------------------------------------------------------
+    def compute_shap(
+        self,
+        n_background: int = 100,
+        n_explain: int = 50,
+    ) -> np.ndarray:
+        """
+        Compute SHAP values using DeepExplainer on the validation set.
+
+        Returns
+        -------
+        shap_mean_abs : np.ndarray of shape (INPUT_WINDOW,)
+            Mean absolute SHAP value per input lag, averaged over
+            all quantiles and forecast steps. Higher = more important lag.
+
+        Also stores:
+            self.shap_values : raw array (n_explain, INPUT_WINDOW, n_quantiles*horizon)
+        """
+        if not self._is_trained:
+            raise RuntimeError("Call .fit() before compute_shap().")
+        if self._X_train is None or self._X_val is None:
+            raise RuntimeError("No training data stored — retrain the model.")
+
+        try:
+            import shap
+            import torch
+        except ImportError:
+            raise ImportError("Install with: pip install shap")
+
+        # Background: random sample from training set
+        n_bg = min(n_background, len(self._X_train))
+        idx_bg = np.random.choice(len(self._X_train), n_bg, replace=False)
+        background = torch.tensor(
+            self._X_train[idx_bg, :, None], dtype=torch.float32
+        ).to(self._device)
+
+        # Samples to explain: last n_explain from val set
+        n_exp = min(n_explain, len(self._X_val))
+        X_exp = torch.tensor(
+            self._X_val[-n_exp:, :, None], dtype=torch.float32
+        ).to(self._device)
+
+        # Flatten LSTM output for SHAP (it expects 2D output)
+        class _FlatNet(torch.nn.Module):
+            def __init__(self, net):
+                super().__init__()
+                self.net = net
+
+            def forward(self, x):
+                out = self.net(x)
+                return out.view(out.shape[0], -1)  # (B, nq*H)
+
+        flat_net = _FlatNet(self._net).to(self._device)
+        flat_net.eval()
+
+        explainer = shap.DeepExplainer(flat_net, background)
+        shap_vals = explainer.shap_values(X_exp)
+        # shap_vals: list of (n_exp, T, 1) per output — length nq*H
+        # Stack to (n_exp, T, nq*H) then squeeze feature dim
+        stacked = np.stack(
+            [sv[:, :, 0] for sv in shap_vals], axis=-1
+        )  # (n_exp, T, nq*H)
+
+        self.shap_values = stacked
+        shap_mean_abs = np.mean(np.abs(stacked), axis=(0, 2))  # (T,)
+        self.shap_importance = shap_mean_abs
+        logger.info(
+            "SHAP computed. Top-3 lags: %s",
+            np.argsort(shap_mean_abs)[::-1][:3].tolist(),
+        )
+        return shap_mean_abs
+
+    # ------------------------------------------------------------------
+    def explain_forecast_lime(
+        self,
+        last_residuals: np.ndarray,
+        quantile_idx: int = 2,
+        horizon_idx: int = 0,
+        num_features: int = 10,
+    ) -> object:
+        """
+        Explain a single forecast using LIME.
+
+        Parameters
+        ----------
+        last_residuals : np.ndarray shape (INPUT_WINDOW,)
+            The input window to explain.
+        quantile_idx   : which quantile head to explain (0=Q10 ... 4=Q90)
+        horizon_idx    : which forecast step to explain (0=day1 ... 14=day15)
+        num_features   : number of top features LIME reports
+
+        Returns
+        -------
+        lime Explanation object — call .as_list() for feature contributions,
+        or .show_in_notebook() if in Jupyter.
+        """
+        if not self._is_trained:
+            raise RuntimeError("Call .fit() before explain_forecast_lime().")
+        if self._X_train is None:
+            raise RuntimeError("No training data stored — retrain the model.")
+
+        try:
+            import torch
+            from lime import lime_tabular
+        except ImportError:
+            raise ImportError("Install with: pip install lime")
+
+        output_idx = quantile_idx * self.horizon + horizon_idx
+
+        def _predict_fn(X_flat: np.ndarray) -> np.ndarray:
+            """Wrapper: flat (N, T) -> scalar output at [quantile, horizon]."""
+            X_3d = X_flat.reshape(-1, self.input_window, 1).astype(np.float32)
+            t = torch.tensor(X_3d).to(self._device)
+            self._net.eval()
+            with torch.no_grad():
+                out = self._net(t)          # (N, nq, H)
+                flat = out.view(out.shape[0], -1)  # (N, nq*H)
+            return flat[:, output_idx].cpu().numpy()
+
+        feature_names = [f"lag_{i+1}d" for i in range(self.input_window)]
+
+        explainer = lime_tabular.LimeTabularExplainer(
+            training_data=self._X_train,
+            feature_names=feature_names,
+            mode="regression",
+            verbose=False,
+        )
+
+        scaled_input = (
+            (last_residuals - self._scaler_mean) / self._scaler_std
+        )
+
+        explanation = explainer.explain_instance(
+            scaled_input,
+            _predict_fn,
+            num_features=num_features,
+        )
+
+        q_label = QUANTILE_LABELS[quantile_idx]
+        logger.info(
+            "LIME explanation for %s day+%d: top feature = %s",
+            q_label,
+            horizon_idx + 1,
+            explanation.as_list()[0][0],
+        )
+        return explanation
+
+    # ------------------------------------------------------------------
     def save(self, path: Path) -> None:
         import torch
         torch.save(
@@ -385,9 +634,12 @@ class _QuantileLSTMModel:
                 "state_dict": self._net.state_dict(),
                 "scaler_mean": self._scaler_mean,
                 "scaler_std": self._scaler_std,
+                "train_losses": self.train_losses,
+                "val_losses": self.val_losses,
             },
             path,
         )
+        logger.info("LSTM saved -> %s", path)
 
     def load(self, path: Path) -> None:
         import torch
@@ -395,7 +647,10 @@ class _QuantileLSTMModel:
         self._net.load_state_dict(ckpt["state_dict"])
         self._scaler_mean = ckpt["scaler_mean"]
         self._scaler_std = ckpt["scaler_std"]
+        self.train_losses = ckpt.get("train_losses", [])
+        self.val_losses = ckpt.get("val_losses", [])
         self._is_trained = True
+        logger.info("LSTM loaded <- %s", path)
 
 
 # ---------------------------------------------------------------------------
@@ -489,6 +744,7 @@ class Forecaster:
 
         self._decomposers: Dict[str, SignalDecomposer] = {}
         self._emp_forecasters: Dict[str, EmpiricalQuantileForecaster] = {}
+        self._persistence_forecasters: Dict[str, PersistenceForecaster] = {}
         self._lstm_models: Dict[str, _QuantileLSTMModel] = {}
 
         self._empirical_fitted: bool = False
@@ -524,8 +780,10 @@ class Forecaster:
             self._decomposers[site] = dc
             eq = EmpiricalQuantileForecaster(dc).fit()
             self._emp_forecasters[site] = eq
+            self._persistence_forecasters[site] = PersistenceForecaster(dc)
             logger.info(
-                "Empirical forecaster fitted for %s (%d days).", site, len(series)
+                "Empirical forecaster fitted for %s (%d days).",
+                site, len(series),
             )
 
         self._empirical_fitted = True
@@ -539,9 +797,17 @@ class Forecaster:
         batch_size: int = 64,
         val_frac: float = 0.15,
         patience: int = 10,
+        gap_threshold: float = GAP_THRESHOLD,
         verbose: bool = True,
         force_retrain: bool = False,
-    ) -> List[float]:
+    ) -> Tuple[List[float], List[float]]:
+        """
+        Train LSTM for one site.
+
+        Returns
+        -------
+        (train_losses, val_losses) per epoch.
+        """
         if not self._empirical_fitted:
             raise RuntimeError("Call fit_empirical() before fit_lstm().")
         if site not in self._decomposers:
@@ -557,8 +823,9 @@ class Forecaster:
             logger.info("Loading existing LSTM from %s", model_path)
             model.load(model_path)
             self._lstm_models[site] = model
-            self._lstm_fitted_sites.append(site)
-            return []
+            if site not in self._lstm_fitted_sites:
+                self._lstm_fitted_sites.append(site)
+            return model.train_losses, model.val_losses
 
         residuals = self._decomposers[site].residuals.values
         if len(residuals) < MIN_TRAIN_DAYS:
@@ -567,20 +834,55 @@ class Forecaster:
                 f"need >= {MIN_TRAIN_DAYS} to train LSTM."
             )
 
-        val_losses = model.fit(
+        train_losses, val_losses = model.fit(
             residuals,
             epochs=epochs,
             lr=lr,
             batch_size=batch_size,
             val_frac=val_frac,
             patience=patience,
+            gap_threshold=gap_threshold,
             verbose=verbose,
         )
         model.save(model_path)
         self._lstm_models[site] = model
         if site not in self._lstm_fitted_sites:
             self._lstm_fitted_sites.append(site)
-        return val_losses
+        return train_losses, val_losses
+
+    def compute_shap(
+        self,
+        site: str,
+        n_background: int = 100,
+        n_explain: int = 50,
+    ) -> np.ndarray:
+        """Return mean absolute SHAP values per input lag for one site."""
+        if site not in self._lstm_models:
+            raise RuntimeError(f"Train LSTM for '{site}' first.")
+        return self._lstm_models[site].compute_shap(n_background, n_explain)
+
+    def explain_forecast_lime(
+        self,
+        site: str,
+        anchor_date: Optional[pd.Timestamp] = None,
+        quantile_idx: int = 2,
+        horizon_idx: int = 0,
+        num_features: int = 10,
+    ) -> object:
+        """Return LIME explanation for one forecast from one site."""
+        if site not in self._lstm_models:
+            raise RuntimeError(f"Train LSTM for '{site}' first.")
+        series = self._get_site_series(site)
+        if anchor_date is None:
+            anchor_date = series.index[-1]
+        resid = self._decomposers[site].residuals
+        context = resid[resid.index <= anchor_date].values[-INPUT_WINDOW:]
+        if len(context) < INPUT_WINDOW:
+            pad = np.zeros(INPUT_WINDOW - len(context))
+            context = np.concatenate([pad, context])
+        return self._lstm_models[site].explain_forecast_lime(
+            context, quantile_idx, horizon_idx, num_features
+        )
 
     def forecast_empirical(
         self,
@@ -596,6 +898,24 @@ class Forecaster:
         fan.attrs["site"] = site
         fan.attrs["variable"] = self.variable
         fan.attrs["method"] = "empirical"
+        return fan
+
+    def forecast_persistence(
+        self,
+        site: str,
+        n_days: int = FORECAST_HORIZON,
+        anchor_date: Optional[pd.Timestamp] = None,
+    ) -> pd.DataFrame:
+        if site not in self._persistence_forecasters:
+            raise RuntimeError(f"fit_empirical() not yet run for site '{site}'.")
+        if anchor_date is None:
+            anchor_date = self._get_site_series(site).index[-1]
+        fan = self._persistence_forecasters[site].forecast(
+            anchor_date, n_days=n_days
+        )
+        fan.attrs["site"] = site
+        fan.attrs["variable"] = self.variable
+        fan.attrs["method"] = "persistence"
         return fan
 
     def forecast_lstm(
@@ -631,7 +951,9 @@ class Forecaster:
         if n_days < FORECAST_HORIZON:
             lstm_resid = lstm_resid[:, :n_days]
         elif n_days > FORECAST_HORIZON:
-            pad = np.repeat(lstm_resid[:, -1:], n_days - FORECAST_HORIZON, axis=1)
+            pad = np.repeat(
+                lstm_resid[:, -1:], n_days - FORECAST_HORIZON, axis=1
+            )
             lstm_resid = np.concatenate([lstm_resid, pad], axis=1)
 
         trend = dc.trend_at(future_dates)
@@ -657,6 +979,7 @@ class Forecaster:
         n_days: int = FORECAST_HORIZON,
         anchor_date: Optional[pd.Timestamp] = None,
     ) -> pd.DataFrame:
+        """Auto-select: LSTM if trained, else empirical."""
         if site in self._lstm_models:
             return self.forecast_lstm(site, n_days=n_days, anchor_date=anchor_date)
         return self.forecast_empirical(site, n_days=n_days, anchor_date=anchor_date)
@@ -667,6 +990,11 @@ class Forecaster:
         method: str = "empirical",
         test_days: int = 90,
     ) -> pd.DataFrame:
+        """
+        Walk-forward pinball loss evaluation on last test_days of data.
+
+        method : "empirical" | "lstm" | "persistence"
+        """
         series = self._get_site_series(site)
         n = len(series)
         if n < INPUT_WINDOW + test_days + 1:
@@ -678,8 +1006,13 @@ class Forecaster:
         for step in range(test_days):
             anchor = series.index[cut_idx + step - 1]
             true_val = float(series.iloc[cut_idx + step])
+
             if method == "lstm" and site in self._lstm_models:
                 fan = self.forecast_lstm(site, n_days=1, anchor_date=anchor)
+            elif method == "persistence":
+                fan = self.forecast_persistence(
+                    site, n_days=1, anchor_date=anchor
+                )
             else:
                 fan = self.forecast_empirical(site, n_days=1, anchor_date=anchor)
 
@@ -699,6 +1032,39 @@ class Forecaster:
                 )
 
         return pd.DataFrame(records)
+
+    def compare_methods(
+        self,
+        site: str,
+        test_days: int = 90,
+    ) -> pd.DataFrame:
+        """
+        Run walk-forward evaluation for all three methods and return a
+        summary table of mean pinball loss per quantile per method.
+
+        Useful for the IEEE paper results section.
+        """
+        methods = ["persistence", "empirical"]
+        if site in self._lstm_models:
+            methods.append("lstm")
+
+        rows = []
+        for method in methods:
+            eval_df = self.evaluate(site, method=method, test_days=test_days)
+            for lbl, grp in eval_df.groupby("label"):
+                rows.append(
+                    {
+                        "method": method,
+                        "quantile": lbl,
+                        "mean_pinball": round(grp["pinball_loss"].mean(), 6),
+                    }
+                )
+
+        return (
+            pd.DataFrame(rows)
+            .pivot(index="quantile", columns="method", values="mean_pinball")
+            .reset_index()
+        )
 
     @staticmethod
     def compute_quantiles(
@@ -737,18 +1103,6 @@ def build_forecasters(
     Build and optionally fit empirical forecasters for solar and wind.
 
     Returns dict with keys "solar" and "wind".
-
-    Example
-    -------
-    >>> from src.nasa_loader import load_combined_csv, quality_filter
-    >>> from src.nasa_loader import gap_fill, add_hub_height_wind
-    >>> from src.forecaster import build_forecasters
-    >>> params = load_params()
-    >>> df = load_combined_csv(params)
-    >>> df = quality_filter(df); df = gap_fill(df)
-    >>> df = add_hub_height_wind(df, params)
-    >>> forecasters = build_forecasters(df)
-    >>> fan = forecasters["solar"].forecast(site="Natal")
     """
     forecasters: Dict[str, Forecaster] = {}
     for var in VARIABLES:
@@ -786,14 +1140,20 @@ class ForecastBundle:
         n_days: int = FORECAST_HORIZON,
         anchor_date: Optional[pd.Timestamp] = None,
     ) -> pd.DataFrame:
-        sol_fan = self._sf.forecast(site, n_days=n_days, anchor_date=anchor_date)
-        wnd_fan = self._wf.forecast(site, n_days=n_days, anchor_date=anchor_date)
+        sol_fan = self._sf.forecast(
+            site, n_days=n_days, anchor_date=anchor_date
+        )
+        wnd_fan = self._wf.forecast(
+            site, n_days=n_days, anchor_date=anchor_date
+        )
 
         sol_fan.columns = [f"solar_{c}" for c in sol_fan.columns]
         wnd_fan.columns = [f"wind_{c}" for c in wnd_fan.columns]
 
         bundle = sol_fan.join(wnd_fan)
-        bundle["rho"] = [self._corr.get(site, dt.month) for dt in bundle.index]
+        bundle["rho"] = [
+            self._corr.get(site, dt.month) for dt in bundle.index
+        ]
         bundle.attrs["site"] = site
         bundle.attrs["n_days"] = n_days
         return bundle

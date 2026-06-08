@@ -364,3 +364,62 @@ def plot_eval_pinball(eval_df: pd.DataFrame, site: str, variable: str) -> None:
 
     safe_site = site.replace(" ", "_").replace("/", "_")
     save(fig, f"10_eval_pinball_{safe_site}_{variable}.png")
+
+
+def plot_train_val_loss(
+    train_losses: list,
+    val_losses: list,
+    site: str,
+    variable: str,
+) -> None:
+    """
+    Train vs validation pinball loss per epoch.
+    The gap between curves diagnoses overfitting.
+    """
+    epochs = range(1, len(train_losses) + 1)
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(epochs, train_losses, label="Train", color="#1f77b4")
+    ax.plot(epochs, val_losses, label="Validation", color="#d62728")
+    ax.fill_between(
+        epochs,
+        train_losses,
+        val_losses,
+        alpha=0.10,
+        color="#d62728",
+        label="Gap",
+    )
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Mean pinball loss")
+    ax.set_title(f"Train vs validation loss — {site} / {variable}")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    safe_site = site.replace(" ", "_").replace("/", "_")
+    save(fig, f"11_train_val_loss_{safe_site}_{variable}.png")
+
+
+def plot_shap_importance(
+    shap_importance: np.ndarray,
+    site: str,
+    variable: str,
+    top_n: int = 20,
+) -> None:
+    """
+    Bar chart of mean absolute SHAP value per input lag.
+    Shows which days in the 60-day window drive the forecast most.
+    """
+    n = len(shap_importance)
+    lags = [f"lag_{i+1}d" for i in range(n)]
+    idx = np.argsort(shap_importance)[::-1][:top_n]
+    top_lags = [lags[i] for i in idx]
+    top_vals = shap_importance[idx]
+
+    color = SITE_COLORS.get(site, "#333333")
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.barh(top_lags[::-1], top_vals[::-1], color=color, alpha=0.85)
+    ax.set_xlabel("Mean |SHAP value|")
+    ax.set_title(
+        f"SHAP feature importance (top {top_n} lags) — {site} / {variable}"
+    )
+    ax.grid(True, axis="x", alpha=0.3)
+    safe_site = site.replace(" ", "_").replace("/", "_")
+    save(fig, f"12_shap_importance_{safe_site}_{variable}.png")
