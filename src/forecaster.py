@@ -41,6 +41,11 @@ import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# Suppress statsmodels convergence warnings globally
+warnings.filterwarnings("ignore", category=UserWarning, module="statsmodels")
+warnings.filterwarnings("ignore", message=".*converge.*")
+warnings.filterwarnings("ignore", message=".*ConvergenceWarning.*")
+
 import numpy as np
 import pandas as pd
 
@@ -892,6 +897,8 @@ class Forecaster:
         self._decomposers: Dict[str, SignalDecomposer] = {}
         self._emp_forecasters: Dict[str, EmpiricalQuantileForecaster] = {}
         self._persistence_forecasters: Dict[str, PersistenceForecaster] = {}
+        self._ets_forecasters: Dict[str, ETSForecaster] = {}
+        self._stlets_forecasters: Dict[str, STLETSForecaster] = {}
         self._lstm_models: Dict[str, _QuantileLSTMModel] = {}
 
         self._empirical_fitted: bool = False
@@ -928,6 +935,8 @@ class Forecaster:
             self._decomposers[site] = dc
             self._emp_forecasters[site] = EmpiricalQuantileForecaster(dc).fit()
             self._persistence_forecasters[site] = PersistenceForecaster(dc)
+            self._ets_forecasters[site] = ETSForecaster(dc).fit(series)
+            self._stlets_forecasters[site] = STLETSForecaster(dc).fit(series)
             logger.info(
                 "Empirical forecaster fitted for %s (%d days).",
                 site, len(series),
@@ -1117,6 +1126,46 @@ class Forecaster:
         )
         return fan
 
+    def forecast_ets(
+        self,
+        site: str,
+        n_days: int = FORECAST_HORIZON,
+        anchor_date: Optional[pd.Timestamp] = None,
+    ) -> pd.DataFrame:
+        if site not in self._ets_forecasters:
+            raise RuntimeError(
+                f"fit_empirical() not yet run for site '{site}'."
+            )
+        if anchor_date is None:
+            anchor_date = self._get_site_series(site).index[-1]
+        fan = self._ets_forecasters[site].forecast(
+            anchor_date, n_days=n_days
+        )
+        fan.attrs.update(
+            {"site": site, "variable": self.variable, "method": "ets"}
+        )
+        return fan
+
+    def forecast_stl_ets(
+        self,
+        site: str,
+        n_days: int = FORECAST_HORIZON,
+        anchor_date: Optional[pd.Timestamp] = None,
+    ) -> pd.DataFrame:
+        if site not in self._stlets_forecasters:
+            raise RuntimeError(
+                f"fit_empirical() not yet run for site '{site}'."
+            )
+        if anchor_date is None:
+            anchor_date = self._get_site_series(site).index[-1]
+        fan = self._stlets_forecasters[site].forecast(
+            anchor_date, n_days=n_days
+        )
+        fan.attrs.update(
+            {"site": site, "variable": self.variable, "method": "stl_ets"}
+        )
+        return fan
+
     def forecast_lstm(
         self,
         site: str,
@@ -1224,6 +1273,14 @@ class Forecaster:
                 fan = self.forecast_persistence(
                     site, n_days=1, anchor_date=anchor
                 )
+            elif method == "ets":
+                fan = self.forecast_ets(
+                    site, n_days=1, anchor_date=anchor
+                )
+            elif method == "stl_ets":
+                fan = self.forecast_stl_ets(
+                    site, n_days=1, anchor_date=anchor
+                )
             else:
                 fan = self.forecast_empirical(
                     site, n_days=1, anchor_date=anchor
@@ -1255,7 +1312,7 @@ class Forecaster:
         Mean pinball loss per quantile per method.
         Produces the results table for the IEEE paper.
         """
-        methods = ["persistence", "empirical"]
+        methods = ["persistence", "ets", "stl_ets", "empirical"]
         if site in self._lstm_models and self._lstm_models[site]._is_trained:
             methods.append("lstm")
 
@@ -1282,6 +1339,43 @@ class Forecaster:
             )
             .reset_index()
         )
+
+    def run_diebold_mariano(
+        self,
+        site: str,
+        reference_method: str = "lstm",
+        quantile: float = 0.50,
+        test_days: int = 90,
+    ) -> pd.DataFrame:
+        """
+        Run DM test comparing reference_method vs all other methods.
+        Returns DataFrame with dm_statistic, p_value, significant columns.
+        """
+        methods = ["persistence", "ets", "stl_ets", "empirical"]
+        if site in self._lstm_models and self._lstm_models[site]._is_trained:
+            methods.append("lstm")
+
+        eval_results = {}
+        for method in methods:
+            try:
+                eval_results[method] = self.evaluate(
+                    site, method=method, test_days=test_days
+                )
+            except Exception as e:
+                logger.warning("DM eval failed for %s: %s", method, e)
+
+        if reference_method not in eval_results:
+            raise ValueError(
+                f"reference_method '{reference_method}' evaluation failed."
+            )
+
+        dm_table = run_diebold_mariano(
+            eval_results,
+            reference_method=reference_method,
+            quantile=quantile,
+        )
+        dm_table.insert(0, "site", site)
+        return dm_table
 
     @staticmethod
     def compute_quantiles(
@@ -1368,3 +1462,335 @@ class ForecastBundle:
         ]
         bundle.attrs.update({"site": site, "n_days": n_days})
         return bundle
+
+
+# ---------------------------------------------------------------------------
+# Classical baselines — ETS and STL+ETS
+# ---------------------------------------------------------------------------
+
+class ETSForecaster:
+    """
+    Exponential Smoothing (Holt-Winters) baseline.
+
+    Fits on the raw series (not residuals) and produces a point forecast
+    repeated across all quantiles — same approach as PersistenceForecaster
+    but adaptive rather than naive.
+
+    Uses additive trend + additive seasonal (period=365).
+    Falls back to simple exponential smoothing if seasonal fit fails.
+    """
+
+    def __init__(self, decomposer: SignalDecomposer) -> None:
+        self._dc = decomposer
+        self._model = None
+        self._series = None
+        self._is_fitted: bool = False
+
+    def fit(self, series: pd.Series) -> "ETSForecaster":
+        from statsmodels.tsa.holtwinters import ExponentialSmoothing
+        self._series = series.copy()
+        try:
+            model = ExponentialSmoothing(
+                series,
+                trend="add",
+                seasonal="add",
+                seasonal_periods=365,
+                initialization_method="estimated",
+            )
+            self._model = model.fit(optimized=True)
+            self._method = "holt_winters"
+        except Exception:
+            # Fallback: simple exponential smoothing
+            model = ExponentialSmoothing(
+                series,
+                trend=None,
+                seasonal=None,
+                initialization_method="estimated",
+            )
+            self._model = model.fit(optimized=True)
+            self._method = "simple_exp"
+        self._is_fitted = True
+        return self
+
+    def forecast(
+        self,
+        anchor_date: pd.Timestamp,
+        n_days: int = FORECAST_HORIZON,
+    ) -> pd.DataFrame:
+        if not self._is_fitted:
+            raise RuntimeError("Call .fit() first.")
+
+        # Get point forecast from ETS
+        series_to_anchor = self._series[self._series.index <= anchor_date]
+        steps = n_days
+
+        try:
+            import warnings
+            from statsmodels.tsa.holtwinters import ExponentialSmoothing
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                if self._method == "holt_winters":
+                    model = ExponentialSmoothing(
+                        series_to_anchor,
+                        trend="add",
+                        seasonal=None,
+                        initialization_method="estimated",
+                    )
+                else:
+                    model = ExponentialSmoothing(
+                        series_to_anchor,
+                        trend=None,
+                        seasonal=None,
+                        initialization_method="estimated",
+                    )
+                fitted = model.fit(optimized=True)
+                point_forecasts = fitted.forecast(steps).values
+        except Exception:
+            # Ultimate fallback: last value repeated
+            point_forecasts = np.full(steps, float(series_to_anchor.iloc[-1]))
+
+        point_forecasts = np.clip(point_forecasts, 0, None)
+
+        future_dates = pd.date_range(
+            start=anchor_date + pd.Timedelta(days=1), periods=n_days, freq="D"
+        )
+
+        rows = []
+        for i, dt in enumerate(future_dates):
+            val = float(point_forecasts[i])
+            row = {lbl: val for lbl in QUANTILE_LABELS}
+            row["date"] = dt
+            rows.append(row)
+
+        fan = pd.DataFrame(rows).set_index("date")
+        fan.attrs.update({"method": "ets"})
+        return fan
+
+
+class STLETSForecaster:
+    """
+    STL decomposition + ETS on residuals baseline.
+
+    This directly challenges the SignalDecomposer + LSTM architecture:
+    both decompose the series the same way, but this uses ETS on residuals
+    instead of LSTM. If LSTM beats STL+ETS, the neural network component
+    is proven valuable beyond the decomposition alone.
+
+    Steps
+    -----
+    1. STL decomposes series into trend + seasonal + residual
+    2. ETS forecasts the residual
+    3. STL trend extrapolated linearly
+    4. STL seasonal projected by periodicity
+    5. Components recomposed
+    """
+
+    def __init__(self, decomposer: SignalDecomposer) -> None:
+        self._dc = decomposer
+        self._series = None
+        self._is_fitted: bool = False
+
+    def fit(self, series: pd.Series) -> "STLETSForecaster":
+        self._series = series.copy()
+        self._is_fitted = True
+        return self
+
+    def forecast(
+        self,
+        anchor_date: pd.Timestamp,
+        n_days: int = FORECAST_HORIZON,
+    ) -> pd.DataFrame:
+        if not self._is_fitted:
+            raise RuntimeError("Call .fit() first.")
+
+        from statsmodels.tsa.stl._stl import STL
+        from statsmodels.tsa.holtwinters import ExponentialSmoothing
+
+        series_to_anchor = self._series[self._series.index <= anchor_date]
+        future_dates = pd.date_range(
+            start=anchor_date + pd.Timedelta(days=1), periods=n_days, freq="D"
+        )
+
+        try:
+            # STL decomposition
+            period = min(365, len(series_to_anchor) // 2)
+            stl = STL(series_to_anchor, period=period, robust=True)
+            stl_fit = stl.fit()
+
+            trend = stl_fit.trend
+            seasonal = stl_fit.seasonal
+            residual = stl_fit.resid
+
+            # Extrapolate trend linearly from last 90 days
+            tail = trend.tail(90)
+            x = np.arange(len(tail))
+            coeffs = np.polyfit(x, tail.values, 1)
+            future_trend = np.array([
+                coeffs[0] * (len(tail) + i) + coeffs[1]
+                for i in range(n_days)
+            ])
+
+            # Project seasonal by period
+            future_seasonal = np.array([
+                float(seasonal.iloc[-(period - (i % period))])
+                for i in range(n_days)
+            ])
+
+            # ETS on residuals
+            try:
+                ets_model = ExponentialSmoothing(
+                    residual,
+                    trend=None,
+                    seasonal=None,
+                    initialization_method="estimated",
+                )
+                ets_fit = ets_model.fit(optimized=True)
+                future_resid = ets_fit.forecast(n_days).values
+            except Exception:
+                future_resid = np.zeros(n_days)
+
+            point_forecasts = np.clip(
+                future_trend + future_seasonal + future_resid, 0, None
+            )
+
+        except Exception:
+            # Fallback: use SignalDecomposer trend+seasonal + last residual
+            trend_vals = self._dc.trend_at(future_dates)
+            seasonal_vals = self._dc.seasonal_at(future_dates)
+            last_resid = float(
+                self._dc.residuals[
+                    self._dc.residuals.index <= anchor_date
+                ].iloc[-1]
+            )
+            point_forecasts = np.clip(
+                trend_vals + seasonal_vals + last_resid, 0, None
+            )
+
+        rows = []
+        for i, dt in enumerate(future_dates):
+            val = float(point_forecasts[i])
+            row = {lbl: val for lbl in QUANTILE_LABELS}
+            row["date"] = dt
+            rows.append(row)
+
+        fan = pd.DataFrame(rows).set_index("date")
+        fan.attrs.update({"method": "stl_ets"})
+        return fan
+
+
+# ---------------------------------------------------------------------------
+# Diebold-Mariano test
+# ---------------------------------------------------------------------------
+
+def diebold_mariano_test(
+    losses_a: np.ndarray,
+    losses_b: np.ndarray,
+    h: int = 1,
+) -> Tuple[float, float]:
+    """
+    Diebold-Mariano test for equal predictive accuracy.
+
+    H0: Models A and B have equal forecast accuracy.
+    H1: They differ.
+
+    Parameters
+    ----------
+    losses_a : np.ndarray of per-step loss values for model A
+    losses_b : np.ndarray of per-step loss values for model B
+    h        : forecast horizon (1 for one-step-ahead)
+
+    Returns
+    -------
+    (dm_statistic, p_value)
+    p_value < 0.05 → reject H0 → difference is statistically significant
+    Negative DM statistic → model A is better (lower loss)
+    Positive DM statistic → model B is better
+    """
+    from scipy import stats
+
+    d = losses_a - losses_b
+    n = len(d)
+    mean_d = np.mean(d)
+
+    # Newey-West HAC variance estimator (accounts for autocorrelation)
+    gamma_0 = np.var(d, ddof=1)
+    nw_var = gamma_0
+    for lag in range(1, h):
+        gamma_lag = np.mean(
+            (d[lag:] - mean_d) * (d[:-lag] - mean_d)
+        )
+        nw_var += 2 * (1 - lag / h) * gamma_lag
+
+    if nw_var <= 0:
+        return 0.0, 1.0
+
+    dm_stat = mean_d / np.sqrt(nw_var / n)
+    p_value = 2 * (1 - stats.norm.cdf(abs(dm_stat)))
+    return float(dm_stat), float(p_value)
+
+
+def run_diebold_mariano(
+    eval_results: Dict[str, pd.DataFrame],
+    reference_method: str = "lstm",
+    quantile: float = 0.50,
+) -> pd.DataFrame:
+    """
+    Run DM test comparing reference_method against all other methods
+    for a specific quantile, across all sites.
+
+    Parameters
+    ----------
+    eval_results     : dict {method: eval_DataFrame} where each DataFrame
+                       has columns date, quantile, label, y_true, y_pred,
+                       pinball_loss — output of Forecaster.evaluate()
+    reference_method : method to test against others (default "lstm")
+    quantile         : quantile to test (default 0.50)
+
+    Returns
+    -------
+    DataFrame with columns:
+      site, method_a, method_b, quantile, dm_statistic, p_value, significant
+    """
+    rows = []
+    methods = list(eval_results.keys())
+    ref = reference_method
+
+    if ref not in methods:
+        raise ValueError(
+            f"reference_method '{ref}' not in eval_results keys: {methods}"
+        )
+
+    ref_df = eval_results[ref]
+    ref_q = ref_df[np.isclose(ref_df["quantile"], quantile)]
+
+    for method in methods:
+        if method == ref:
+            continue
+        other_df = eval_results[method]
+        other_q = other_df[np.isclose(other_df["quantile"], quantile)]
+
+        # Align by date
+        common_dates = ref_q["date"].values
+        ref_losses = ref_q.set_index("date")["pinball_loss"]
+        other_losses = other_q.set_index("date")["pinball_loss"]
+
+        common = ref_losses.index.intersection(other_losses.index)
+        if len(common) < 10:
+            continue
+
+        dm_stat, p_val = diebold_mariano_test(
+            ref_losses.loc[common].values,
+            other_losses.loc[common].values,
+            h=1,
+        )
+        rows.append({
+            "method_a": ref,
+            "method_b": method,
+            "quantile": quantile,
+            "dm_statistic": round(dm_stat, 4),
+            "p_value": round(p_val, 4),
+            "significant": "yes" if p_val < 0.05 else "no",
+            "winner": ref if dm_stat < 0 else method,
+        })
+
+    return pd.DataFrame(rows)

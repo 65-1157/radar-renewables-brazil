@@ -486,3 +486,60 @@ def plot_comparison_heatmap(
     )
     plt.tight_layout()
     save(fig, f"13_comparison_heatmap_{variable}.png")
+
+
+def plot_dm_heatmap(
+    dm_df: pd.DataFrame,
+    variable: str,
+) -> None:
+    """
+    Heatmap of Diebold-Mariano p-values.
+    Rows = sites, columns = methods compared against reference.
+    Green = significant improvement, red = not significant.
+    """
+    if dm_df.empty:
+        return
+
+    sites = dm_df["site"].unique().tolist()
+    methods = dm_df["method_b"].unique().tolist()
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+
+    for ax, metric, label in zip(
+        axes,
+        ["p_value", "dm_statistic"],
+        ["p-value (green < 0.05 = significant)", "DM statistic (negative = LSTM better)"],
+    ):
+        pivot_rows = []
+        for site in sites:
+            row = {"site": site}
+            for method in methods:
+                sub = dm_df[
+                    (dm_df["site"] == site) &
+                    (dm_df["method_b"] == method)
+                ]
+                row[method] = round(float(sub[metric].values[0]), 4) if len(sub) else np.nan
+            pivot_rows.append(row)
+
+        pivot = pd.DataFrame(pivot_rows).set_index("site")[methods]
+
+        cmap = "RdYlGn_r" if metric == "p_value" else "RdYlGn"
+        im = ax.imshow(pivot.values.astype(float), aspect="auto", cmap=cmap)
+        ax.set_xticks(range(len(methods)))
+        ax.set_xticklabels([m.upper() for m in methods], fontsize=8, rotation=15)
+        ax.set_yticks(range(len(sites)))
+        ax.set_yticklabels(sites, fontsize=8)
+        for i in range(len(sites)):
+            for j in range(len(methods)):
+                val = pivot.values[i, j]
+                if not np.isnan(val):
+                    ax.text(j, i, f"{val:.3f}", ha="center", va="center", fontsize=7)
+        plt.colorbar(im, ax=ax)
+        ax.set_title(label, fontsize=9)
+
+    fig.suptitle(
+        f"Diebold-Mariano test — LSTM vs others — {variable} — Q50",
+        y=1.02,
+    )
+    plt.tight_layout()
+    save(fig, f"14_dm_heatmap_{variable}.png")

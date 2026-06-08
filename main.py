@@ -229,6 +229,33 @@ def cmd_comparison(args: argparse.Namespace) -> None:
         # Save heatmap
         plot_comparison_heatmap(full_table, variable)
 
+        # Diebold-Mariano test if --dm flag set and LSTM available
+        if args.dm:
+            print(f"\nRunning Diebold-Mariano test ({variable})...")
+            from src.visualiser import plot_dm_heatmap
+            dm_rows = []
+            for site in SITES:
+                if site not in fcast._lstm_models:
+                    continue
+                try:
+                    dm = fcast.run_diebold_mariano(
+                        site=site,
+                        reference_method="lstm",
+                        quantile=0.50,
+                        test_days=90,
+                    )
+                    dm_rows.append(dm)
+                    print(f"  {site}: done")
+                except Exception as e:
+                    print(f"  {site}: SKIPPED ({e})")
+            if dm_rows:
+                dm_table = pd.concat(dm_rows, ignore_index=True)
+                dm_path = out_dir / f"dm_test_{variable}.csv"
+                dm_table.to_csv(dm_path, index=False)
+                print(f"Saved -> {dm_path}")
+                print(dm_table.to_string(index=False))
+                plot_dm_heatmap(dm_table, variable)
+
 
 # ---------------------------------------------------------------------------
 # Argument parser
@@ -330,6 +357,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=90,
         metavar="N",
         help="Walk-forward test window in days (default: 90)",
+    )
+    p_cmp.add_argument(
+        "--dm",
+        action="store_true",
+        help="Run Diebold-Mariano significance test (requires LSTM checkpoints)",
     )
 
     return parser
