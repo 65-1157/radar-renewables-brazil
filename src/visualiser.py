@@ -543,3 +543,268 @@ def plot_dm_heatmap(
     )
     plt.tight_layout()
     save(fig, f"14_dm_heatmap_{variable}.png")
+
+
+# ---------------------------------------------------------------------------
+# Autonomy visualisations
+# ---------------------------------------------------------------------------
+
+def plot_autonomy_bars(
+    scenario_table: pd.DataFrame,
+    top_n: int = 10,
+) -> None:
+    """
+    Horizontal bar chart of top N scenarios by autonomous days %.
+    Saves 15_autonomy_bars.png
+    """
+    top = scenario_table.head(top_n).copy()
+    top["label"] = (
+        top["location"] + "\n"
+        + top["panel_area_m2"].astype(str) + "m² / "
+        + top["n_turbines"].astype(str) + "T"
+    )
+    colors = [SITE_COLORS.get(loc, "#333333") for loc in top["location"]]
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.barh(top["label"], top["autonomous_days_pct"], color=colors, alpha=0.85)
+    ax.set_xlabel("Autonomous days (%)")
+    ax.set_title(f"Top {top_n} scenarios — autonomous operation without diesel")
+    ax.axvline(x=10, color="green", linestyle="--", linewidth=0.8,
+               label="10% threshold")
+    ax.legend(fontsize=8)
+    ax.grid(True, axis="x", alpha=0.3)
+    save(fig, "15_autonomy_bars.png")
+
+
+def plot_autonomy_consecutive(
+    scenario_table: pd.DataFrame,
+    top_n: int = 10,
+) -> None:
+    """
+    Bar chart of max consecutive autonomous days for top N scenarios.
+    Saves 16_autonomy_consecutive.png
+    """
+    top = scenario_table.head(top_n).copy()
+    top["label"] = (
+        top["location"] + "\n"
+        + top["panel_area_m2"].astype(str) + "m² / "
+        + top["n_turbines"].astype(str) + "T"
+    )
+    colors = [SITE_COLORS.get(loc, "#333333") for loc in top["location"]]
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    bars = ax.barh(
+        top["label"], top["max_consecutive_days"],
+        color=colors, alpha=0.85
+    )
+    ax.set_xlabel("Maximum consecutive autonomous days")
+    ax.set_title(
+        f"Top {top_n} scenarios — longest autonomous run (no diesel)"
+    )
+    for bar, val in zip(bars, top["max_consecutive_days"]):
+        ax.text(
+            bar.get_width() + 0.3, bar.get_y() + bar.get_height() / 2,
+            f"{int(val)}d", va="center", fontsize=8,
+        )
+    ax.grid(True, axis="x", alpha=0.3)
+    save(fig, "16_autonomy_consecutive.png")
+
+
+def plot_battery_sizing(battery_table: pd.DataFrame) -> None:
+    """
+    Grouped bar chart: battery kWh needed for 3/7/15 day autonomy per site.
+    Saves 17_battery_sizing.png
+    """
+    sites = battery_table["location"].tolist()
+    x = np.arange(len(sites))
+    width = 0.25
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.bar(x - width, battery_table["battery_3d_kwh"],
+           width, label="3-day autonomy", alpha=0.85, color="#1f77b4")
+    ax.bar(x, battery_table["battery_7d_kwh"],
+           width, label="7-day autonomy", alpha=0.85, color="#ff7f0e")
+    ax.bar(x + width, battery_table["battery_15d_kwh"],
+           width, label="15-day autonomy", alpha=0.85, color="#d62728")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(sites, rotation=15, ha="right", fontsize=8)
+    ax.set_ylabel("Battery capacity required (kWh)")
+    ax.set_title(
+        "Battery sizing for 3 / 7 / 15-day autonomous operation\n"
+        "Best scenario per site (200m² + 3 turbines)"
+    )
+    ax.legend()
+    ax.grid(True, axis="y", alpha=0.3)
+    save(fig, "17_battery_sizing.png")
+
+
+def plot_quantile_autonomy(quantile_table: pd.DataFrame) -> None:
+    """
+    Grouped bar chart: autonomous days % for Q10/Q50/Q90 per site.
+    Shows uncertainty in autonomy estimates.
+    Saves 18_quantile_autonomy.png
+    """
+    sites = quantile_table["location"].unique().tolist()
+    x = np.arange(len(sites))
+    width = 0.25
+
+    q10 = quantile_table[quantile_table["quantile"] == "Q10"]
+    q50 = quantile_table[quantile_table["quantile"] == "Q50"]
+    q90 = quantile_table[quantile_table["quantile"] == "Q90"]
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.bar(x - width,
+           [float(q10[q10["location"] == s]["autonomous_days_pct"].values[0])
+            if len(q10[q10["location"] == s]) > 0 else 0 for s in sites],
+           width, label="Q10 (pessimistic)", alpha=0.85, color="#d62728")
+    ax.bar(x,
+           [float(q50[q50["location"] == s]["autonomous_days_pct"].values[0])
+            if len(q50[q50["location"] == s]) > 0 else 0 for s in sites],
+           width, label="Q50 (expected)", alpha=0.85, color="#1f77b4")
+    ax.bar(x + width,
+           [float(q90[q90["location"] == s]["autonomous_days_pct"].values[0])
+            if len(q90[q90["location"] == s]) > 0 else 0 for s in sites],
+           width, label="Q90 (optimistic)", alpha=0.85, color="#2ca02c")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(sites, rotation=15, ha="right", fontsize=8)
+    ax.set_ylabel("Autonomous days (%)")
+    ax.set_title(
+        "Autonomous operation uncertainty — Q10 / Q50 / Q90\n"
+        "Best scenario per site (200m² + 3 turbines)"
+    )
+    ax.legend()
+    ax.grid(True, axis="y", alpha=0.3)
+    save(fig, "18_quantile_autonomy.png")
+
+
+# ---------------------------------------------------------------------------
+# Dispatch strategy visualisations
+# ---------------------------------------------------------------------------
+
+def plot_dispatch_comparison(dispatch_table: pd.DataFrame) -> None:
+    """
+    Grouped bar chart comparing annual diesel litres per strategy per site.
+    Saves 19_dispatch_comparison.png
+    """
+    sites = dispatch_table["location"].unique().tolist()
+    strategies = ["base_load", "load_following", "forecast_driven"]
+    strategy_labels = ["Base Load (S2)", "Load Following (S1)",
+                       "Forecast-Driven (S3)"]
+    strategy_colors = ["#d62728", "#1f77b4", "#2ca02c"]
+
+    x = np.arange(len(sites))
+    width = 0.25
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    for i, (strat, label, color) in enumerate(
+        zip(strategies, strategy_labels, strategy_colors)
+    ):
+        vals = []
+        for site in sites:
+            sub = dispatch_table[
+                (dispatch_table["location"] == site) &
+                (dispatch_table["strategy"] == strat)
+            ]
+            vals.append(float(sub["annual_diesel_litres"].values[0])
+                        if len(sub) > 0 else 0.0)
+        offset = (i - 1) * width
+        ax.bar(x + offset, vals, width, label=label,
+               color=color, alpha=0.85)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(sites, rotation=15, ha="right", fontsize=8)
+    ax.set_ylabel("Annual diesel consumption (litres)")
+    ax.set_title("Dispatch strategy comparison — annual diesel consumption")
+    ax.legend()
+    ax.grid(True, axis="y", alpha=0.3)
+    save(fig, "19_dispatch_comparison.png")
+
+
+def plot_dispatch_improvement(improvement_table: pd.DataFrame) -> None:
+    """
+    Bar chart: Strategy 3 vs Strategy 1 diesel saving % per site.
+    Saves 20_dispatch_improvement.png
+    """
+    imp = improvement_table[
+        improvement_table["diesel_saving_pct"] > 0
+    ].copy()
+
+    if imp.empty:
+        print("  No improvement to plot — all sites show 0% saving.")
+        return
+
+    colors = [SITE_COLORS.get(loc, "#333333") for loc in imp["location"]]
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Left: diesel saving %
+    axes[0].barh(imp["location"], imp["diesel_saving_pct"],
+                 color=colors, alpha=0.85)
+    axes[0].set_xlabel("Diesel saving (%)")
+    axes[0].set_title("Forecast-driven vs load-following\ndiesel saving %")
+    axes[0].grid(True, axis="x", alpha=0.3)
+
+    # Right: cost saving USD/yr
+    axes[1].barh(imp["location"], imp["cost_saving_usd_yr"],
+                 color=colors, alpha=0.85)
+    axes[1].set_xlabel("Annual cost saving (USD)")
+    axes[1].set_title("Forecast-driven vs load-following\nannual cost saving")
+    axes[1].grid(True, axis="x", alpha=0.3)
+
+    fig.suptitle(
+        "Strategy 3 (forecast-driven) improvement over Strategy 1 (load-following)",
+        y=1.02,
+    )
+    plt.tight_layout()
+    save(fig, "20_dispatch_improvement.png")
+
+
+def plot_dispatch_renewable_fraction(dispatch_table: pd.DataFrame) -> None:
+    """
+    Stacked view: renewable fraction and autonomous days per strategy per site.
+    Saves 21_dispatch_renewable.png
+    """
+    sites = dispatch_table["location"].unique().tolist()
+    strategies = ["load_following", "forecast_driven"]
+    strategy_labels = ["Load Following (S1)", "Forecast-Driven (S3)"]
+    strategy_colors = ["#1f77b4", "#2ca02c"]
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    for ax, metric, ylabel, title in zip(
+        axes,
+        ["renewable_fraction_pct", "autonomous_days_pct"],
+        ["Renewable fraction (%)", "Autonomous days (%)"],
+        ["Renewable energy fraction", "Autonomous operation days"],
+    ):
+        x = np.arange(len(sites))
+        width = 0.35
+        for i, (strat, label, color) in enumerate(
+            zip(strategies, strategy_labels, strategy_colors)
+        ):
+            vals = []
+            for site in sites:
+                sub = dispatch_table[
+                    (dispatch_table["location"] == site) &
+                    (dispatch_table["strategy"] == strat)
+                ]
+                vals.append(
+                    float(sub[metric].values[0]) if len(sub) > 0 else 0.0
+                )
+            offset = (i - 0.5) * width
+            ax.bar(x + offset, vals, width, label=label,
+                   color=color, alpha=0.85)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(sites, rotation=15, ha="right", fontsize=8)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.legend(fontsize=8)
+        ax.grid(True, axis="y", alpha=0.3)
+
+    fig.suptitle("S1 vs S3 — renewable utilisation and autonomous operation",
+                 y=1.02)
+    plt.tight_layout()
+    save(fig, "21_dispatch_renewable.png")

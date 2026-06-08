@@ -201,7 +201,7 @@ def cmd_dispatch(args: argparse.Namespace) -> None:
         solar_forecaster = sf
         wind_forecaster = wf
 
-    run_dispatch_analysis(
+    results = run_dispatch_analysis(
         all_data, demand_df, params, sites_config,
         solar_forecaster=solar_forecaster,
         wind_forecaster=wind_forecaster,
@@ -211,6 +211,15 @@ def cmd_dispatch(args: argparse.Namespace) -> None:
         save_csv=True,
         verbose=True,
     )
+
+    from src.visualiser import (
+        plot_dispatch_comparison, plot_dispatch_improvement,
+        plot_dispatch_renewable_fraction,
+    )
+    plot_dispatch_comparison(results["dispatch_table"])
+    plot_dispatch_improvement(results["improvement_table"])
+    plot_dispatch_renewable_fraction(results["dispatch_table"])
+    print("Dispatch plots saved to outputs/")
 
 
 def cmd_autonomy(args: argparse.Namespace) -> None:
@@ -251,13 +260,24 @@ def cmd_autonomy(args: argparse.Namespace) -> None:
         solar_forecasters = {site: sf for site in all_data}
         wind_forecasters = {site: wf for site in all_data}
 
-    run_autonomy_analysis(
+    results = run_autonomy_analysis(
         all_data, demand_df, params, sites_config,
         solar_forecasters=solar_forecasters,
         wind_forecasters=wind_forecasters,
         save_csv=True,
         verbose=True,
     )
+
+    from src.visualiser import (
+        plot_autonomy_bars, plot_autonomy_consecutive,
+        plot_battery_sizing, plot_quantile_autonomy,
+    )
+    plot_autonomy_bars(results["scenario_table"])
+    plot_autonomy_consecutive(results["scenario_table"])
+    plot_battery_sizing(results["battery_sizing"])
+    if "quantile_table" in results:
+        plot_quantile_autonomy(results["quantile_table"])
+    print("Autonomy plots saved to outputs/")
 
     if args.breakeven:
         print("\nFinding autonomy breakeven scenarios...")
