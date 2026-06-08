@@ -190,6 +190,14 @@ def cmd_comparison(args: argparse.Namespace) -> None:
         fcast = Forecaster(df, variable=variable)
         fcast.fit_empirical()
 
+        # Load LSTM checkpoints if available
+        for site in SITES:
+            try:
+                fcast.fit_lstm(site=site, verbose=False)
+                print(f"  LSTM loaded: {site}/{variable}")
+            except Exception:
+                pass
+
         all_rows = []
         for site in SITES:
             print(f"  Evaluating {site}...", end=" ", flush=True)
