@@ -950,7 +950,8 @@ class _NBEATSModel:
             model = self._build_model(mult * self.horizon, lr, n_blocks, mlp_width, patience)
             nf = NeuralForecast(models=[model], freq="D")
             try:
-                cv_df = nf.cross_validation(nf_df, n_windows=n_windows, step_size=self.horizon)
+                cv_df = nf.cross_validation(
+                    nf_df, n_windows=n_windows, step_size=self.horizon, val_size=self.horizon)
             except Exception as exc:
                 logger.warning("N-BEATS trial failed: %s", exc)
                 raise optuna.exceptions.TrialPruned()
