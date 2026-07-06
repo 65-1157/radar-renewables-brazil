@@ -906,7 +906,7 @@ class _NBEATSModel:
             early_stop_patience_steps=patience,   # <-- patience, mirrors LSTM
             val_check_steps=10,
             scaler_type="standard",
-            accelerator="gpu",
+            accelerator="gpu" if torch.cuda.is_available() else "cpu",
         )
 
     def _to_nf_frame(self, residuals: np.ndarray, site: str) -> pd.DataFrame:
