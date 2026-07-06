@@ -377,145 +377,68 @@ class _QuantileLSTMModel:
         return np.array(X, dtype=np.float32), np.array(Y, dtype=np.float32)
 
     # ------------------------------------------------------------------
-    def tune(
-        self,
-        residuals: np.ndarray,
-        n_trials: int = 20,
-        val_frac: float = 0.15,
-        epochs_per_trial: int = 15,
-        patience_per_trial: int = 3,
-        verbose: bool = True,
-    ) -> Dict:
-        """
-        Run Optuna hyperparameter search.
-
-        Searches over:
-          hidden_size  : [32, 64, 96, 128]
-          num_layers   : [1, 2, 3]
-          dropout      : [0.1, 0.5]
-          lr           : [1e-4, 1e-2]  log scale
-          batch_size   : [32, 64, 128]
-          input_window : [30, 45, 60, 90]
-
-        Returns best_params dict.
-        Updates self.input_window and rebuilds self._net with best params
-        so that fit() can be called immediately after.
-        """
-        try:
-            import optuna
-            import torch
-            from torch.utils.data import DataLoader, TensorDataset
-        except ImportError:
-            raise ImportError("Install with: pip install optuna torch")
-
-        # Silence Optuna's per-trial output unless verbose
-        if not verbose:
-            optuna.logging.set_verbosity(optuna.logging.WARNING)
-        else:
-            optuna.logging.set_verbosity(optuna.logging.INFO)
-
-        scaler_mean = float(np.mean(residuals))
-        scaler_std = float(np.std(residuals)) or 1.0
-        scaled = (residuals - scaler_mean) / scaler_std
-
-        def objective(trial: optuna.Trial) -> float:
-            h_size = trial.suggest_categorical(
-                "hidden_size", [32, 64, 96, 128]
-            )
-            n_layers = trial.suggest_int("num_layers", 1, 3)
-            drop = trial.suggest_float("dropout", 0.1, 0.5)
-            lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
-            b_size = trial.suggest_categorical("batch_size", [32, 64, 128])
-            i_win = trial.suggest_categorical(
-                "input_window", [30, 45, 60, 90]
-            )
-
-            X, Y = self._make_sequences(scaled, i_win)
-            if len(X) < 10:
-                return float("inf")
-
-            n_val = max(1, int(len(X) * val_frac))
-            X_tr, Y_tr = X[:-n_val], Y[:-n_val]
-            X_val, Y_val = X[-n_val:], Y[-n_val:]
-
-            X_tr_t = torch.tensor(X_tr[:, :, None]).to(self._device)
-            Y_tr_t = torch.tensor(Y_tr).to(self._device)
-            X_val_t = torch.tensor(X_val[:, :, None]).to(self._device)
-            Y_val_t = torch.tensor(Y_val).to(self._device)
-
-            net = _build_net(
-                h_size, n_layers, drop, self.n_quantiles, self.horizon
-            ).to(self._device)
-            optim = torch.optim.Adam(net.parameters(), lr=lr)
-
-            ds = TensorDataset(X_tr_t, Y_tr_t)
-            loader = DataLoader(ds, batch_size=b_size, shuffle=True)
-
-            best_val = math.inf
-            patience_counter = 0
-
-            for epoch in range(epochs_per_trial):
-                net.train()
-                for xb, yb in loader:
-                    optim.zero_grad()
-                    preds = net(xb)
-                    loss = self._pinball_loss_torch(
-                        preds, yb.unsqueeze(1).expand(preds.shape)
-                    )
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
-                    optim.step()
-
-                net.eval()
-                with torch.no_grad():
-                    val_preds = net(X_val_t)
-                    val_loss = self._pinball_loss_torch(
-                        val_preds,
-                        Y_val_t.unsqueeze(1).expand_as(val_preds),
-                    )
-                vl = float(val_loss.item())
-
-                # Optuna pruning
-                trial.report(vl, epoch)
-                if trial.should_prune():
-                    raise optuna.exceptions.TrialPruned()
-
-                if vl < best_val:
-                    best_val = vl
-                    patience_counter = 0
-                else:
-                    patience_counter += 1
-                    if patience_counter >= patience_per_trial:
-                        break
-
-            return best_val
-
-        study = optuna.create_study(
-            direction="minimize",
-            sampler=optuna.samplers.TPESampler(seed=42),
-            pruner=optuna.pruners.MedianPruner(n_startup_trials=5),
-        )
-        study.optimize(objective, n_trials=n_trials, show_progress_bar=verbose)
-
-        best = study.best_params
-        self.best_params = best
-        logger.info("Optuna best params: %s", best)
-        logger.info("Optuna best val pinball: %.5f", study.best_value)
-
-        # Rebuild model with best params
-        self.input_window = best["input_window"]
-        self.hidden_size = best["hidden_size"]
-        self.num_layers = best["num_layers"]
-        self.dropout = best["dropout"]
-        self._net = _build_net(
-            self.hidden_size,
-            self.num_layers,
-            self.dropout,
-            self.n_quantiles,
-            self.horizon,
-        ).to(self._device)
-
-        return best
+    def tune(self, residuals: np.ndarray, site: str, n_trials: int = 20,
+            n_windows: int = 3, patience: int = 10, verbose: bool = True) -> Dict:
+      try:
+          import optuna
+          from neuralforecast import NeuralForecast
+      except ImportError:
+          raise ImportError("Install with: pip install optuna neuralforecast")
+  
+      optuna.logging.set_verbosity(optuna.logging.INFO if verbose else optuna.logging.WARNING)
+      nf_df = self._to_nf_frame(residuals, site)
+  
+      def objective(trial: "optuna.Trial") -> float:
+          mult = trial.suggest_categorical("input_window_mult", [2, 3, 4, 6])
+          lr = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
+          n_blocks = trial.suggest_int("n_blocks", 1, 3)
+          mlp_width = trial.suggest_categorical("mlp_units_width", [128, 256, 512])
+  
+          # patience=None here on purpose — no early-stop callback during CV,
+          # since Lightning's EarlyStopping can't see ptl/val_loss reliably
+          # inside per-window cross_validation() refits.
+          model = self._build_model(
+              mult * self.horizon, lr, n_blocks, mlp_width, patience=None
+          )
+          nf = NeuralForecast(models=[model], freq="D")
+          try:
+              cv_df = nf.cross_validation(
+                  nf_df, n_windows=n_windows, step_size=self.horizon, val_size=self.horizon
+              )
+          except Exception as exc:
+              logger.warning("N-BEATS trial failed: %s", exc)
+              raise optuna.exceptions.TrialPruned()
+  
+          q_cols = [c for c in cv_df.columns if c not in ("unique_id", "ds", "cutoff", "y")]
+          if not q_cols:
+              raise optuna.exceptions.TrialPruned()
+          q50_col = q_cols[len(QUANTILES) // 2]
+          return pinball_loss_numpy(
+              cv_df["y"].values, np.clip(cv_df[q50_col].values, 0, None), 0.50
+          )
+  
+      study = optuna.create_study(
+          direction="minimize",
+          sampler=optuna.samplers.TPESampler(seed=42),
+          pruner=optuna.pruners.MedianPruner(n_startup_trials=5),
+      )
+      study.optimize(objective, n_trials=n_trials)
+  
+      completed = [t for t in study.trials if t.state.name == "COMPLETE"]
+      if not completed:
+          raise RuntimeError(
+              "N-BEATS Optuna study: all trials failed or were pruned — "
+              "check the 'N-BEATS trial failed' warnings above for the real cause "
+              "before proceeding."
+          )
+  
+      best = dict(study.best_params)
+      best["input_size"] = best.pop("input_window_mult") * self.horizon
+      self.best_params = best
+      self.input_window = best["input_size"]
+      logger.info("N-BEATS Optuna best params: %s", best)
+      logger.info("N-BEATS Optuna best val pinball (Q50): %.5f", study.best_value)
+      return best
 
     # ------------------------------------------------------------------
     def fit(
