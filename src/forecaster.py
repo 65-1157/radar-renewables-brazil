@@ -993,7 +993,7 @@ class _NBEATSModel:
     def fit(self, residuals: np.ndarray, site: str, patience: int = 10, verbose: bool = True):
         """Train final N-BEATS model with Optuna best params (or defaults)."""
         from neuralforecast import NeuralForecast
-
+    
         p = self.best_params or {
             "input_size": self.input_window, "learning_rate": 1e-3,
             "n_blocks": 2, "mlp_units_width": 256,
@@ -1001,7 +1001,17 @@ class _NBEATSModel:
         model = self._build_model(p["input_size"], p["learning_rate"], p["n_blocks"], p["mlp_units_width"], patience)
         nf_df = self._to_nf_frame(residuals, site)
         self._nf = NeuralForecast(models=[model], freq="D")
-        self._nf.fit(nf_df, val_size=self.horizon * 3)
+    
+        try:
+            self._nf.fit(nf_df, val_size=self.horizon * 3)
+        except Exception as e:
+            logger.warning("N-BEATS fit with early stopping failed (%s); retrying without patience.", e)
+            model_no_patience = self._build_model(
+                p["input_size"], p["learning_rate"], p["n_blocks"], p["mlp_units_width"], patience=None
+            )
+            self._nf = NeuralForecast(models=[model_no_patience], freq="D")
+            self._nf.fit(nf_df, val_size=self.horizon * 3)
+    
         self._site = site
         self._is_trained = True
         return self.train_losses, self.val_losses
