@@ -908,7 +908,10 @@ class _NBEATSModel:
             scaler_type="standard",
             accelerator="gpu" if torch.cuda.is_available() else "cpu",
         )
-
+        if patience is not None:
+            kwargs["early_stop_patience_steps"] = patience
+            kwargs["val_check_steps"] = 10
+        return NBEATS(**kwargs)
     def _to_nf_frame(self, residuals: np.ndarray, site: str) -> pd.DataFrame:
         dates = pd.date_range("2000-01-01", periods=len(residuals), freq="D")
         return pd.DataFrame({"unique_id": site, "ds": dates, "y": residuals.astype(float)})
@@ -947,7 +950,7 @@ class _NBEATSModel:
             n_blocks = trial.suggest_int("n_blocks", 1, 3)
             mlp_width = trial.suggest_categorical("mlp_units_width", [128, 256, 512])
 
-            model = self._build_model(mult * self.horizon, lr, n_blocks, mlp_width, patience)
+            model = self._build_model(mult * self.horizon, lr, n_blocks, mlp_width, patience = None)
             nf = NeuralForecast(models=[model], freq="D")
             try:
                 cv_df = nf.cross_validation(
