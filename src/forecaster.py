@@ -85,6 +85,7 @@ DEFAULT_BATCH_SIZE: int = 64
 # Helper — pinball loss
 # ---------------------------------------------------------------------------
 
+
 def pinball_loss_numpy(
     y_true: np.ndarray,
     y_pred: np.ndarray,
@@ -97,6 +98,7 @@ def pinball_loss_numpy(
 # ---------------------------------------------------------------------------
 # Signal decomposition
 # ---------------------------------------------------------------------------
+
 
 class SignalDecomposer:
     def __init__(self, trend_window: int = TREND_WINDOW) -> None:
@@ -127,18 +129,12 @@ class SignalDecomposer:
             counts[d] += 1
         with np.errstate(invalid="ignore"):
             profile = np.where(counts > 0, profile / counts, 0.0)
-        smooth = (
-            pd.Series(profile[1:])
-            .rolling(15, center=True, min_periods=1)
-            .mean()
-        )
+        smooth = pd.Series(profile[1:]).rolling(15, center=True, min_periods=1).mean()
         self._seasonal_profile = np.concatenate([[0.0], smooth.values])
 
         seasonal_vals = np.array([self._seasonal_profile[d] for d in doy])
         residual = detrended - seasonal_vals
-        self._residual = pd.Series(
-            residual.values, index=series.index, name="residual"
-        )
+        self._residual = pd.Series(residual.values, index=series.index, name="residual")
 
         self._is_fitted = True
         return self
@@ -177,6 +173,7 @@ class SignalDecomposer:
 # Phase 1 — Empirical quantile forecaster
 # ---------------------------------------------------------------------------
 
+
 class EmpiricalQuantileForecaster:
     def __init__(self, decomposer: SignalDecomposer) -> None:
         self._dc = decomposer
@@ -190,9 +187,7 @@ class EmpiricalQuantileForecaster:
             vals = resid.values[doys == doy]
             if len(vals) == 0:
                 vals = resid.values[doys == 365]
-            self._doy_quantiles[doy] = {
-                q: float(np.quantile(vals, q)) for q in QUANTILES
-            }
+            self._doy_quantiles[doy] = {q: float(np.quantile(vals, q)) for q in QUANTILES}
         self._is_fitted = True
         return self
 
@@ -215,10 +210,7 @@ class EmpiricalQuantileForecaster:
         for i, doy in enumerate(doys):
             base = trend[i] + seasonal[i]
             q_dict = self._doy_quantiles[doy]
-            row = {
-                lbl: base + q_dict[q]
-                for q, lbl in zip(QUANTILES, QUANTILE_LABELS)
-            }
+            row = {lbl: base + q_dict[q] for q, lbl in zip(QUANTILES, QUANTILE_LABELS)}
             row["date"] = future_dates[i]
             rows.append(row)
 
@@ -228,6 +220,7 @@ class EmpiricalQuantileForecaster:
 # ---------------------------------------------------------------------------
 # Persistence baseline
 # ---------------------------------------------------------------------------
+
 
 class PersistenceForecaster:
     """Naive baseline: last observed value repeated for all horizons."""
@@ -262,6 +255,7 @@ class PersistenceForecaster:
 # ---------------------------------------------------------------------------
 # LSTM network definition (standalone so Optuna can reinstantiate it)
 # ---------------------------------------------------------------------------
+
 
 def _build_net(
     hidden_size: int,
@@ -300,9 +294,11 @@ def _build_net(
 # Phase 2 — Multi-quantile LSTM
 # ---------------------------------------------------------------------------
 
+
 def _try_import_torch() -> bool:
     try:
         import torch  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -324,9 +320,7 @@ class _QuantileLSTMModel:
         dropout: float = DEFAULT_DROPOUT,
     ) -> None:
         if not _try_import_torch():
-            raise ImportError(
-                "PyTorch is required. Install with: pip install torch"
-            )
+            raise ImportError("PyTorch is required. Install with: pip install torch")
         import torch
 
         self.input_window = input_window
@@ -335,13 +329,11 @@ class _QuantileLSTMModel:
         self.num_layers = num_layers
         self.dropout = dropout
         self.n_quantiles = len(QUANTILES)
-        self._device = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
+        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self._net = _build_net(
-            hidden_size, num_layers, dropout, self.n_quantiles, horizon
-        ).to(self._device)
+        self._net = _build_net(hidden_size, num_layers, dropout, self.n_quantiles, horizon).to(
+            self._device
+        )
 
         self._scaler_mean: float = 0.0
         self._scaler_std: float = 1.0
@@ -355,9 +347,10 @@ class _QuantileLSTMModel:
     # ------------------------------------------------------------------
     def _pinball_loss_torch(self, preds, targets):
         import torch
+
         total = torch.zeros(1, device=self._device)
         for qi, q in enumerate(QUANTILES):
-            p = preds[:, qi, :]                          # (B, H)
+            p = preds[:, qi, :]  # (B, H)
             t = targets[:, qi, :] if targets.dim() == 3 else targets  # (B, H)
             err = t - p
             loss = torch.where(err >= 0, q * err, (q - 1) * err)
@@ -377,68 +370,139 @@ class _QuantileLSTMModel:
         return np.array(X, dtype=np.float32), np.array(Y, dtype=np.float32)
 
     # ------------------------------------------------------------------
-    def tune(self, residuals: np.ndarray, site: str, n_trials: int = 20,
-            n_windows: int = 3, patience: int = 10, verbose: bool = True) -> Dict:
-      try:
-          import optuna
-          from neuralforecast import NeuralForecast
-      except ImportError:
-          raise ImportError("Install with: pip install optuna neuralforecast")
-  
-      optuna.logging.set_verbosity(optuna.logging.INFO if verbose else optuna.logging.WARNING)
-      nf_df = self._to_nf_frame(residuals, site)
-  
-      def objective(trial: "optuna.Trial") -> float:
-          mult = trial.suggest_categorical("input_window_mult", [2, 3, 4, 6])
-          lr = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
-          n_blocks = trial.suggest_int("n_blocks", 1, 3)
-          mlp_width = trial.suggest_categorical("mlp_units_width", [128, 256, 512])
-  
-          # patience=None here on purpose — no early-stop callback during CV,
-          # since Lightning's EarlyStopping can't see ptl/val_loss reliably
-          # inside per-window cross_validation() refits.
-          model = self._build_model(
-              mult * self.horizon, lr, n_blocks, mlp_width, patience=None
-          )
-          nf = NeuralForecast(models=[model], freq="D")
-          try:
-              cv_df = nf.cross_validation(
-                  nf_df, n_windows=n_windows, step_size=self.horizon, val_size=self.horizon
-              )
-          except Exception as exc:
-              logger.warning("N-BEATS trial failed: %s", exc)
-              raise optuna.exceptions.TrialPruned()
-  
-          q_cols = [c for c in cv_df.columns if c not in ("unique_id", "ds", "cutoff", "y")]
-          if not q_cols:
-              raise optuna.exceptions.TrialPruned()
-          q50_col = q_cols[len(QUANTILES) // 2]
-          return pinball_loss_numpy(
-              cv_df["y"].values, np.clip(cv_df[q50_col].values, 0, None), 0.50
-          )
-  
-      study = optuna.create_study(
-          direction="minimize",
-          sampler=optuna.samplers.TPESampler(seed=42),
-          pruner=optuna.pruners.MedianPruner(n_startup_trials=5),
-      )
-      study.optimize(objective, n_trials=n_trials)
-  
-      completed = [t for t in study.trials if t.state.name == "COMPLETE"]
-      if not completed:
-          raise RuntimeError(
-              "N-BEATS Optuna study: all trials failed or were pruned — "
-              "check the 'N-BEATS trial failed' warnings above for the real cause "
-              "before proceeding."
-          )
-  
-      best = dict(study.best_params)
-      best["input_size"] = best.pop("input_window_mult") * self.horizon
-      self.best_params = best
-      self.input_window = best["input_size"]
-      logger.info("N-BEATS Optuna best params: %s", best)
-      logger.info("N-BEATS Optuna best val pinball (Q50): %.5f", study.best_value)
-      return best
+    def tune(
+        self,
+        residuals: np.ndarray,
+        n_trials: int = 20,
+        val_frac: float = 0.15,
+        epochs_per_trial: int = 15,
+        patience_per_trial: int = 3,
+        verbose: bool = True,
+    ) -> Dict:
+        """
+        Run Optuna hyperparameter search.
+
+        Searches over:
+          hidden_size  : [32, 64, 96, 128]
+          num_layers   : [1, 2, 3]
+          dropout      : [0.1, 0.5]
+          lr           : [1e-4, 1e-2]  log scale
+          batch_size   : [32, 64, 128]
+          input_window : [30, 45, 60, 90]
+
+        Returns best_params dict (keys: hidden_size, num_layers, dropout,
+        lr, batch_size, input_window) and rebuilds self._net with the
+        best configuration so fit() can be called immediately after.
+        """
+        try:
+            import optuna
+            import torch
+            from torch.utils.data import DataLoader, TensorDataset
+        except ImportError:
+            raise ImportError("Install with: pip install optuna torch")
+
+        optuna.logging.set_verbosity(
+            optuna.logging.INFO if verbose else optuna.logging.WARNING
+        )
+
+        scaler_mean = float(np.mean(residuals))
+        scaler_std = float(np.std(residuals)) or 1.0
+        scaled = (residuals - scaler_mean) / scaler_std
+
+        def objective(trial: "optuna.Trial") -> float:
+            hidden_size = trial.suggest_categorical("hidden_size", [32, 64, 96, 128])
+            num_layers = trial.suggest_int("num_layers", 1, 3)
+            dropout = trial.suggest_float("dropout", 0.1, 0.5)
+            lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
+            batch_size = trial.suggest_categorical("batch_size", [32, 64, 128])
+            input_window = trial.suggest_categorical("input_window", [30, 45, 60, 90])
+
+            net = _build_net(
+                hidden_size, num_layers, dropout, self.n_quantiles, self.horizon
+            ).to(self._device)
+
+            X, Y = self._make_sequences(scaled, input_window)
+            if len(X) < 20:
+                raise optuna.exceptions.TrialPruned()
+            n_val = max(1, int(len(X) * val_frac))
+            X_tr, Y_tr = X[:-n_val], Y[:-n_val]
+            X_val, Y_val = X[-n_val:], Y[-n_val:]
+
+            X_tr_t = torch.tensor(X_tr[:, :, None]).to(self._device)
+            Y_tr_t = torch.tensor(Y_tr).to(self._device)
+            X_val_t = torch.tensor(X_val[:, :, None]).to(self._device)
+            Y_val_t = torch.tensor(Y_val).to(self._device)
+
+            ds = TensorDataset(X_tr_t, Y_tr_t)
+            loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
+            optim = torch.optim.Adam(net.parameters(), lr=lr)
+
+            best_val = math.inf
+            patience_counter = 0
+
+            for epoch in range(1, epochs_per_trial + 1):
+                net.train()
+                for xb, yb in loader:
+                    optim.zero_grad()
+                    preds = net(xb)
+                    loss = self._pinball_loss_torch(preds, yb.unsqueeze(1).expand_as(preds))
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+                    optim.step()
+
+                net.eval()
+                with torch.no_grad():
+                    val_preds = net(X_val_t)
+                    val_loss = self._pinball_loss_torch(
+                        val_preds, Y_val_t.unsqueeze(1).expand_as(val_preds)
+                    )
+                vl = float(val_loss.item())
+
+                if vl < best_val:
+                    best_val = vl
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= patience_per_trial:
+                        break
+
+                trial.report(vl, epoch)
+                if trial.should_prune():
+                    raise optuna.exceptions.TrialPruned()
+
+            return best_val
+
+        study = optuna.create_study(
+            direction="minimize",
+            sampler=optuna.samplers.TPESampler(seed=42),
+            pruner=optuna.pruners.MedianPruner(n_startup_trials=5),
+        )
+        study.optimize(objective, n_trials=n_trials)
+
+        completed = [t for t in study.trials if t.state.name == "COMPLETE"]
+        if not completed:
+            raise RuntimeError(
+                "LSTM Optuna study: all trials failed or were pruned — "
+                "check the warnings above before proceeding."
+            )
+
+        best = dict(study.best_params)
+        self.best_params = best
+        self.input_window = best["input_window"]
+        self.hidden_size = best["hidden_size"]
+        self.num_layers = best["num_layers"]
+        self.dropout = best["dropout"]
+        self._net = _build_net(
+            self.hidden_size,
+            self.num_layers,
+            self.dropout,
+            self.n_quantiles,
+            self.horizon,
+        ).to(self._device)
+
+        logger.info("Optuna best params: %s", best)
+        logger.info("Optuna best val pinball: %.5f", study.best_value)
+        return best
 
     # ------------------------------------------------------------------
     def fit(
@@ -500,9 +564,7 @@ class _QuantileLSTMModel:
             for xb, yb in loader:
                 optim.zero_grad()
                 preds = self._net(xb)
-                loss = self._pinball_loss_torch(
-                    preds, yb.unsqueeze(1).expand_as(preds)
-                )
+                loss = self._pinball_loss_torch(preds, yb.unsqueeze(1).expand_as(preds))
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self._net.parameters(), 1.0)
                 optim.step()
@@ -524,29 +586,33 @@ class _QuantileLSTMModel:
             if verbose and epoch % 10 == 0:
                 logger.info(
                     "Epoch %3d/%d  train=%.5f  val=%.5f  gap=%.5f",
-                    epoch, epochs, train_loss, vl, gap,
+                    epoch,
+                    epochs,
+                    train_loss,
+                    vl,
+                    gap,
                 )
 
             if vl < best_val:
                 best_val = vl
                 patience_counter = 0
-                best_state = {
-                    k: v.clone()
-                    for k, v in self._net.state_dict().items()
-                }
+                best_state = {k: v.clone() for k, v in self._net.state_dict().items()}
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
                     logger.info(
                         "Early stop (patience=%d) at epoch %d",
-                        patience, epoch,
+                        patience,
+                        epoch,
                     )
                     break
 
             if gap > gap_threshold:
                 logger.info(
                     "Early stop (gap=%.4f > %.4f) at epoch %d",
-                    gap, gap_threshold, epoch,
+                    gap,
+                    gap_threshold,
+                    epoch,
                 )
                 break
 
@@ -562,9 +628,7 @@ class _QuantileLSTMModel:
         import torch
 
         scaled = (last_residuals - self._scaler_mean) / self._scaler_std
-        x = torch.tensor(
-            scaled[None, :, None], dtype=torch.float32
-        ).to(self._device)
+        x = torch.tensor(scaled[None, :, None], dtype=torch.float32).to(self._device)
         self._net.eval()
         with torch.no_grad():
             out = self._net(x)
@@ -588,14 +652,14 @@ class _QuantileLSTMModel:
 
         n_bg = min(n_background, len(self._X_train))
         idx_bg = np.random.choice(len(self._X_train), n_bg, replace=False)
-        background = torch.tensor(
-            self._X_train[idx_bg, :, None], dtype=torch.float32
-        ).to(self._device)
+        background = torch.tensor(self._X_train[idx_bg, :, None], dtype=torch.float32).to(
+            self._device
+        )
 
         n_exp = min(n_explain, len(self._X_val))
-        X_exp = torch.tensor(
-            self._X_val[-n_exp:, :, None], dtype=torch.float32
-        ).to(self._device)
+        X_exp = torch.tensor(self._X_val[-n_exp:, :, None], dtype=torch.float32).to(
+            self._device
+        )
 
         import torch.nn as nn
 
@@ -613,9 +677,7 @@ class _QuantileLSTMModel:
 
         explainer = shap.GradientExplainer(flat_net, background)
         shap_vals = explainer.shap_values(X_exp)
-        stacked = np.stack(
-            [sv[:, :, 0] for sv in shap_vals], axis=-1
-        )
+        stacked = np.stack([sv[:, :, 0] for sv in shap_vals], axis=-1)
         self.shap_values = stacked
         shap_mean_abs = np.mean(np.abs(stacked), axis=(0, 2))
         self.shap_importance = shap_mean_abs
@@ -646,9 +708,7 @@ class _QuantileLSTMModel:
         output_idx = quantile_idx * self.horizon + horizon_idx
 
         def _predict_fn(X_flat: np.ndarray) -> np.ndarray:
-            X_3d = X_flat.reshape(
-                -1, self.input_window, 1
-            ).astype(np.float32)
+            X_3d = X_flat.reshape(-1, self.input_window, 1).astype(np.float32)
             t = torch.tensor(X_3d).to(self._device)
             self._net.eval()
             with torch.no_grad():
@@ -665,22 +725,19 @@ class _QuantileLSTMModel:
             verbose=False,
         )
 
-        scaled_input = (
-            (last_residuals - self._scaler_mean) / self._scaler_std
-        )
+        scaled_input = (last_residuals - self._scaler_mean) / self._scaler_std
         explanation = explainer.explain_instance(
             scaled_input,
             _predict_fn,
             num_features=num_features,
         )
-        logger.info(
-            "LIME top feature: %s", explanation.as_list()[0][0]
-        )
+        logger.info("LIME top feature: %s", explanation.as_list()[0][0])
         return explanation
 
     # ------------------------------------------------------------------
     def save(self, path: Path) -> None:
         import torch
+
         torch.save(
             {
                 "state_dict": self._net.state_dict(),
@@ -700,6 +757,7 @@ class _QuantileLSTMModel:
 
     def load(self, path: Path, residuals: Optional[np.ndarray] = None) -> None:
         import torch
+
         ckpt = torch.load(path, map_location=self._device)
         self.input_window = ckpt.get("input_window", DEFAULT_INPUT_WINDOW)
         self.hidden_size = ckpt.get("hidden_size", DEFAULT_HIDDEN_SIZE)
@@ -731,6 +789,7 @@ class _QuantileLSTMModel:
 # ---------------------------------------------------------------------------
 # Solar-wind correlation
 # ---------------------------------------------------------------------------
+
 
 class SiteCorrelationEstimator:
     SUMMER_MONTHS = {11, 12, 1, 2, 3}
@@ -774,17 +833,50 @@ class SiteCorrelationEstimator:
     def get(self, site: str, month: int) -> float:
         season = self._season(month)
         return self.correlations.get(site, {}).get(season, 0.0)
-# ----------------------------------------------------------------------------
+
+
 # ---------------------------------------------------------------------------
 # Phase 3 — N-BEATS (neuralforecast), same rigor as the LSTM path
 # ---------------------------------------------------------------------------
 
+
 def _try_import_neuralforecast() -> bool:
     try:
         import neuralforecast  # noqa: F401
+
         return True
     except ImportError:
         return False
+
+
+def _new_nbeats_loss_history():
+    """
+    Return a fresh PyTorch Lightning Callback instance that records real
+    per-epoch train/val loss, since Lightning's `callback_metrics` only
+    holds the latest scalar value, not a full history. Import is deferred
+    so forecaster.py can still be imported when pytorch_lightning (an
+    N-BEATS-only dependency) isn't installed.
+    """
+    from pytorch_lightning.callbacks import Callback
+
+    class _LossHistory(Callback):
+        def __init__(self):
+            self.train_losses: List[float] = []
+            self.val_losses: List[float] = []
+
+        def on_train_epoch_end(self, trainer, pl_module):
+            for key in ("train_loss_epoch", "train_loss"):
+                if key in trainer.callback_metrics:
+                    self.train_losses.append(float(trainer.callback_metrics[key]))
+                    break
+
+        def on_validation_epoch_end(self, trainer, pl_module):
+            for key in ("valid_loss", "ptl/val_loss"):
+                if key in trainer.callback_metrics:
+                    self.val_losses.append(float(trainer.callback_metrics[key]))
+                    break
+
+    return _LossHistory()
 
 
 class _NBEATSModel:
@@ -814,12 +906,20 @@ class _NBEATSModel:
         self.val_losses: List[float] = []
         self._is_trained: bool = False
 
-    def _build_model(self, input_size, learning_rate, n_blocks, mlp_width,
-                      patience=None, max_steps=None):
+    def _build_model(
+        self,
+        input_size,
+        learning_rate,
+        n_blocks,
+        mlp_width,
+        patience=None,
+        max_steps=None,
+        callbacks=None,
+    ):
         from neuralforecast.models import NBEATS
         from neuralforecast.losses.pytorch import MQLoss
         import torch
-    
+
         kwargs = dict(
             h=self.horizon,
             input_size=input_size,
@@ -831,10 +931,17 @@ class _NBEATSModel:
             scaler_type="standard",
             accelerator="gpu" if torch.cuda.is_available() else "cpu",
         )
+        # patience=None on purpose during Optuna/CV trials: Lightning's
+        # EarlyStopping cannot reliably see `ptl/val_loss` inside per-window
+        # cross_validation() refits, so early stopping is only attached to
+        # the final single-split fit() call below.
         if patience is not None:
             kwargs["early_stop_patience_steps"] = patience
             kwargs["val_check_steps"] = 10
+        if callbacks:
+            kwargs["trainer_kwargs"] = {"callbacks": callbacks}
         return NBEATS(**kwargs)
+
     def _to_nf_frame(self, residuals: np.ndarray, site: str) -> pd.DataFrame:
         dates = pd.date_range("2000-01-01", periods=len(residuals), freq="D")
         return pd.DataFrame({"unique_id": site, "ds": dates, "y": residuals.astype(float)})
@@ -873,11 +980,17 @@ class _NBEATSModel:
             n_blocks = trial.suggest_int("n_blocks", 1, 3)
             mlp_width = trial.suggest_categorical("mlp_units_width", [128, 256, 512])
 
-            model = self._build_model(mult * self.horizon, lr, n_blocks, mlp_width, patience = None)
+            model = self._build_model(
+                mult * self.horizon, lr, n_blocks, mlp_width, patience=None
+            )
             nf = NeuralForecast(models=[model], freq="D")
             try:
                 cv_df = nf.cross_validation(
-                    nf_df, n_windows=n_windows, step_size=self.horizon, val_size=self.horizon)
+                    nf_df,
+                    n_windows=n_windows,
+                    step_size=self.horizon,
+                    val_size=self.horizon,
+                )
             except Exception as exc:
                 logger.warning("N-BEATS trial failed: %s", exc)
                 raise optuna.exceptions.TrialPruned()
@@ -913,28 +1026,61 @@ class _NBEATSModel:
         return best
 
     # ------------------------------------------------------------------
-    def fit(self, residuals: np.ndarray, site: str, patience: int = 10, verbose: bool = True):
-        """Train final N-BEATS model with Optuna best params (or defaults)."""
+    def fit(
+        self, residuals: np.ndarray, site: str, patience: int = 10, verbose: bool = True
+    ) -> Tuple[List[float], List[float]]:
+        """
+        Train final N-BEATS model with Optuna best params (or defaults),
+        with patience-based early stopping via early_stop_patience_steps.
+        Captures real per-epoch train/val loss via a Lightning callback
+        (self.train_losses / self.val_losses), same return shape as the
+        LSTM's fit().
+        """
         from neuralforecast import NeuralForecast
-    
+
         p = self.best_params or {
-            "input_size": self.input_window, "learning_rate": 1e-3,
-            "n_blocks": 2, "mlp_units_width": 256,
+            "input_size": self.input_window,
+            "learning_rate": 1e-3,
+            "n_blocks": 2,
+            "mlp_units_width": 256,
         }
-        model = self._build_model(p["input_size"], p["learning_rate"], p["n_blocks"], p["mlp_units_width"], patience)
+
+        history = _new_nbeats_loss_history()
+
+        def _build(patience_val):
+            return self._build_model(
+                p["input_size"],
+                p["learning_rate"],
+                p["n_blocks"],
+                p["mlp_units_width"],
+                patience=patience_val,
+                callbacks=[history],
+            )
+
         nf_df = self._to_nf_frame(residuals, site)
-        self._nf = NeuralForecast(models=[model], freq="D")
-    
+
         try:
+            model = _build(patience)
+            self._nf = NeuralForecast(models=[model], freq="D")
             self._nf.fit(nf_df, val_size=self.horizon * 3)
         except Exception as e:
-            logger.warning("N-BEATS fit with early stopping failed (%s); retrying without patience.", e)
-            model_no_patience = self._build_model(
-                p["input_size"], p["learning_rate"], p["n_blocks"], p["mlp_units_width"], patience=None
+            logger.warning(
+                "N-BEATS fit with early stopping failed (%s); retrying without patience.", e
             )
-            self._nf = NeuralForecast(models=[model_no_patience], freq="D")
+            history = _new_nbeats_loss_history()
+            model = self._build_model(
+                p["input_size"],
+                p["learning_rate"],
+                p["n_blocks"],
+                p["mlp_units_width"],
+                patience=None,
+                callbacks=[history],
+            )
+            self._nf = NeuralForecast(models=[model], freq="D")
             self._nf.fit(nf_df, val_size=self.horizon * 3)
-    
+
+        self.train_losses = history.train_losses
+        self.val_losses = history.val_losses
         self._site = site
         self._is_trained = True
         return self.train_losses, self.val_losses
@@ -950,7 +1096,9 @@ class _NBEATSModel:
             preds.append(float(fcst[q_cols[len(QUANTILES) // 2]].iloc[0]))
         return np.array(preds)
 
-    def compute_shap(self, residual_windows: np.ndarray, n_background: int = 30, n_explain: int = 20) -> np.ndarray:
+    def compute_shap(
+        self, residual_windows: np.ndarray, n_background: int = 30, n_explain: int = 20
+    ) -> np.ndarray:
         """
         Model-agnostic SHAP via KernelExplainer, since NeuralForecast
         doesn't expose a plain forward() like the hand-rolled LSTM.
@@ -965,7 +1113,7 @@ class _NBEATSModel:
             raise RuntimeError("Call fit() before compute_shap().")
 
         background = residual_windows[:n_background]
-        X_exp = residual_windows[n_background:n_background + n_explain]
+        X_exp = residual_windows[n_background : n_background + n_explain]
         explainer = shap.KernelExplainer(self._predict_fn, background)
         shap_vals = explainer.shap_values(X_exp, nsamples=100)
         importance = np.mean(np.abs(shap_vals), axis=0)
@@ -973,7 +1121,9 @@ class _NBEATSModel:
         logger.info("N-BEATS SHAP top-3 lags: %s", np.argsort(importance)[::-1][:3].tolist())
         return importance
 
-    def explain_lime(self, residual_windows: np.ndarray, instance: np.ndarray, num_features: int = 10):
+    def explain_lime(
+        self, residual_windows: np.ndarray, instance: np.ndarray, num_features: int = 10
+    ):
         try:
             from lime import lime_tabular
         except ImportError:
@@ -982,16 +1132,21 @@ class _NBEATSModel:
             raise RuntimeError("Call fit() before explain_lime().")
 
         explainer = lime_tabular.LimeTabularExplainer(
-            residual_windows, mode="regression",
+            residual_windows,
+            mode="regression",
             feature_names=[f"lag_{i}" for i in range(residual_windows.shape[1])],
         )
-        explanation = explainer.explain_instance(instance, self._predict_fn, num_features=num_features)
+        explanation = explainer.explain_instance(
+            instance, self._predict_fn, num_features=num_features
+        )
         logger.info("N-BEATS LIME top feature: %s", explanation.as_list()[0][0])
         return explanation
+
 
 # ---------------------------------------------------------------------------
 # Top-level Forecaster
 # ---------------------------------------------------------------------------
+
 
 class Forecaster:
     """
@@ -1036,6 +1191,7 @@ class Forecaster:
         self._ets_forecasters: Dict[str, ETSForecaster] = {}
         self._stlets_forecasters: Dict[str, STLETSForecaster] = {}
         self._lstm_models: Dict[str, _QuantileLSTMModel] = {}
+        self._nbeats_models: Dict[str, "_NBEATSModel"] = {}
 
         self._empirical_fitted: bool = False
         self._lstm_fitted_sites: List[str] = []
@@ -1051,14 +1207,11 @@ class Forecaster:
         )
         if sub.empty:
             raise ValueError(
-                f"No data found for site='{site}', "
-                f"variable='{self.variable}'."
+                f"No data found for site='{site}', " f"variable='{self.variable}'."
             )
         return sub[self._col].asfreq("D").interpolate("linear")
 
-    def fit_empirical(
-        self, sites: Optional[List[str]] = None
-    ) -> "Forecaster":
+    def fit_empirical(self, sites: Optional[List[str]] = None) -> "Forecaster":
         available = self._df["location"].unique().tolist()
         sites = sites or available
 
@@ -1075,7 +1228,8 @@ class Forecaster:
             self._stlets_forecasters[site] = STLETSForecaster(dc).fit(series)
             logger.info(
                 "Empirical forecaster fitted for %s (%d days).",
-                site, len(series),
+                site,
+                len(series),
             )
 
         self._empirical_fitted = True
@@ -1099,18 +1253,13 @@ class Forecaster:
         if not self._empirical_fitted:
             raise RuntimeError("Call fit_empirical() before tune_lstm().")
 
-        params_path = (
-            self._model_dir
-            / f"optuna_{self.variable}_{site.replace(' ', '_')}.npy"
-        )
+        params_path = self._model_dir / f"optuna_{self.variable}_{site.replace(' ', '_')}.npy"
 
         model = _QuantileLSTMModel()
 
         if params_path.exists() and not force_retune:
             best_params = dict(np.load(params_path, allow_pickle=True).item())
-            logger.info(
-                "Loaded existing Optuna params for %s: %s", site, best_params
-            )
+            logger.info("Loaded existing Optuna params for %s: %s", site, best_params)
             model.best_params = best_params
             model.input_window = best_params["input_window"]
             model.hidden_size = best_params["hidden_size"]
@@ -1152,10 +1301,7 @@ class Forecaster:
         if not self._empirical_fitted:
             raise RuntimeError("Call fit_empirical() before fit_lstm().")
 
-        model_path = (
-            self._model_dir
-            / f"lstm_{self.variable}_{site.replace(' ', '_')}.pt"
-        )
+        model_path = self._model_dir / f"lstm_{self.variable}_{site.replace(' ', '_')}.pt"
 
         # Reuse existing model object from tune_lstm if available
         if site not in self._lstm_models:
@@ -1215,7 +1361,9 @@ class Forecaster:
         if anchor_date is None:
             anchor_date = series.index[-1]
         resid = self._decomposers[site].residuals
-        context = resid[resid.index <= anchor_date].values[-self._lstm_models[site].input_window:]
+        context = resid[resid.index <= anchor_date].values[
+            -self._lstm_models[site].input_window :
+        ]
         iw = self._lstm_models[site].input_window
         if len(context) < iw:
             pad = np.zeros(iw - len(context))
@@ -1224,45 +1372,106 @@ class Forecaster:
             context, quantile_idx, horizon_idx, num_features
         )
 
-  # ------------------------------------------------------------------------------
-    def tune_nbeats(self, site: str, n_trials: int = 20, patience: int = 10,
-                         verbose: bool = True, force_retune: bool = False) -> Dict:
-            if not self._empirical_fitted:
-                raise RuntimeError("Call fit_empirical() before tune_nbeats().")
-            if not hasattr(self, "_nbeats_models"):
-                self._nbeats_models: Dict[str, "_NBEATSModel"] = {}
-    
-            params_path = self._model_dir / f"optuna_nbeats_{self.variable}_{site.replace(' ', '_')}.npy"
-            model = _NBEATSModel()
-    
-            if params_path.exists() and not force_retune:
-                best_params = dict(np.load(params_path, allow_pickle=True).item())
-                model.best_params = best_params
-                model.input_window = best_params["input_size"]
-                self._nbeats_models[site] = model
-                return best_params
-    
-            residuals = self._decomposers[site].residuals.values
-            best_params = model.tune(residuals, site, n_trials=n_trials, patience=patience, verbose=verbose)
-            np.save(params_path, best_params)
+    # ------------------------------------------------------------------
+    def tune_nbeats(
+        self,
+        site: str,
+        n_trials: int = 20,
+        patience: int = 10,
+        verbose: bool = True,
+        force_retune: bool = False,
+    ) -> Dict:
+        """Run Optuna search for N-BEATS at one site. Mirrors tune_lstm()."""
+        if not self._empirical_fitted:
+            raise RuntimeError("Call fit_empirical() before tune_nbeats().")
+
+        params_path = (
+            self._model_dir / f"optuna_nbeats_{self.variable}_{site.replace(' ', '_')}.npy"
+        )
+        model = _NBEATSModel()
+
+        if params_path.exists() and not force_retune:
+            best_params = dict(np.load(params_path, allow_pickle=True).item())
+            model.best_params = best_params
+            model.input_window = best_params["input_size"]
             self._nbeats_models[site] = model
             return best_params
-    
-    def fit_nbeats(self, site: str, patience: int = 10, verbose: bool = True):
-        if not hasattr(self, "_nbeats_models"):
-            self._nbeats_models = {}
+
+        residuals = self._decomposers[site].residuals.values
+        best_params = model.tune(
+            residuals, site, n_trials=n_trials, patience=patience, verbose=verbose
+        )
+        np.save(params_path, best_params)
+        self._nbeats_models[site] = model
+        return best_params
+
+    def fit_nbeats(
+        self, site: str, patience: int = 10, verbose: bool = True
+    ) -> Tuple[List[float], List[float]]:
+        """Train final N-BEATS model for one site. Mirrors fit_lstm()."""
         if site not in self._nbeats_models:
             self._nbeats_models[site] = _NBEATSModel()
         residuals = self._decomposers[site].residuals.values
-        return self._nbeats_models[site].fit(residuals, site, patience=patience, verbose=verbose)
-    
-    def compute_shap_nbeats(self, site: str, n_background: int = 30, n_explain: int = 20) -> np.ndarray:
+        return self._nbeats_models[site].fit(
+            residuals, site, patience=patience, verbose=verbose
+        )
+
+    def compute_shap_nbeats(
+        self, site: str, n_background: int = 30, n_explain: int = 20
+    ) -> np.ndarray:
         residuals = self._decomposers[site].residuals.values
         iw = self._nbeats_models[site].input_window
-        windows = np.array([residuals[i:i+iw] for i in range(len(residuals) - iw)])
+        windows = np.array([residuals[i : i + iw] for i in range(len(residuals) - iw)])
         return self._nbeats_models[site].compute_shap(windows, n_background, n_explain)
 
-  # ------------------------------------------------------------------------------
+    def forecast_nbeats(
+        self,
+        site: str,
+        n_days: int = FORECAST_HORIZON,
+        anchor_date: Optional[pd.Timestamp] = None,
+    ) -> pd.DataFrame:
+        """N-BEATS forecast, same interface as forecast_lstm()."""
+        if site not in self._nbeats_models or not self._nbeats_models[site]._is_trained:
+            raise RuntimeError(
+                f"N-BEATS not trained for '{site}'. Call fit_nbeats('{site}') first."
+            )
+
+        dc = self._decomposers[site]
+        model = self._nbeats_models[site]
+        series = self._get_site_series(site)
+
+        if anchor_date is None:
+            anchor_date = series.index[-1]
+
+        resid = dc.residuals
+        iw = model.input_window
+        context = resid[resid.index <= anchor_date].values[-iw:]
+        if len(context) < iw:
+            pad = np.zeros(iw - len(context))
+            context = np.concatenate([pad, context])
+
+        context_df = model._to_nf_frame(context, site)
+        fcst = model._nf.predict(df=context_df)
+        q_cols = [c for c in fcst.columns if c not in ("unique_id", "ds")]
+
+        future_dates = pd.date_range(
+            start=anchor_date + pd.Timedelta(days=1), periods=FORECAST_HORIZON, freq="D"
+        )
+        rows = []
+        for i, dt in enumerate(future_dates[:n_days]):
+            row = {"date": dt}
+            for qi, lbl in enumerate(QUANTILE_LABELS):
+                col = q_cols[qi] if qi < len(q_cols) else q_cols[-1]
+                row[lbl] = (
+                    float(fcst[col].iloc[i]) if i < len(fcst) else float(fcst[col].iloc[-1])
+                )
+            rows.append(row)
+
+        fan = pd.DataFrame(rows).set_index("date").clip(lower=0.0)
+        fan.attrs.update({"site": site, "variable": self.variable, "method": "nbeats"})
+        return fan
+
+    # ------------------------------------------------------------------
 
     def forecast_empirical(
         self,
@@ -1271,15 +1480,11 @@ class Forecaster:
         anchor_date: Optional[pd.Timestamp] = None,
     ) -> pd.DataFrame:
         if not self._empirical_fitted or site not in self._emp_forecasters:
-            raise RuntimeError(
-                f"fit_empirical() not yet run for site '{site}'."
-            )
+            raise RuntimeError(f"fit_empirical() not yet run for site '{site}'.")
         if anchor_date is None:
             anchor_date = self._get_site_series(site).index[-1]
         fan = self._emp_forecasters[site].forecast(anchor_date, n_days=n_days)
-        fan.attrs.update(
-            {"site": site, "variable": self.variable, "method": "empirical"}
-        )
+        fan.attrs.update({"site": site, "variable": self.variable, "method": "empirical"})
         return fan
 
     def forecast_persistence(
@@ -1289,17 +1494,11 @@ class Forecaster:
         anchor_date: Optional[pd.Timestamp] = None,
     ) -> pd.DataFrame:
         if site not in self._persistence_forecasters:
-            raise RuntimeError(
-                f"fit_empirical() not yet run for site '{site}'."
-            )
+            raise RuntimeError(f"fit_empirical() not yet run for site '{site}'.")
         if anchor_date is None:
             anchor_date = self._get_site_series(site).index[-1]
-        fan = self._persistence_forecasters[site].forecast(
-            anchor_date, n_days=n_days
-        )
-        fan.attrs.update(
-            {"site": site, "variable": self.variable, "method": "persistence"}
-        )
+        fan = self._persistence_forecasters[site].forecast(anchor_date, n_days=n_days)
+        fan.attrs.update({"site": site, "variable": self.variable, "method": "persistence"})
         return fan
 
     def forecast_ets(
@@ -1309,17 +1508,11 @@ class Forecaster:
         anchor_date: Optional[pd.Timestamp] = None,
     ) -> pd.DataFrame:
         if site not in self._ets_forecasters:
-            raise RuntimeError(
-                f"fit_empirical() not yet run for site '{site}'."
-            )
+            raise RuntimeError(f"fit_empirical() not yet run for site '{site}'.")
         if anchor_date is None:
             anchor_date = self._get_site_series(site).index[-1]
-        fan = self._ets_forecasters[site].forecast(
-            anchor_date, n_days=n_days
-        )
-        fan.attrs.update(
-            {"site": site, "variable": self.variable, "method": "ets"}
-        )
+        fan = self._ets_forecasters[site].forecast(anchor_date, n_days=n_days)
+        fan.attrs.update({"site": site, "variable": self.variable, "method": "ets"})
         return fan
 
     def forecast_stl_ets(
@@ -1329,17 +1522,11 @@ class Forecaster:
         anchor_date: Optional[pd.Timestamp] = None,
     ) -> pd.DataFrame:
         if site not in self._stlets_forecasters:
-            raise RuntimeError(
-                f"fit_empirical() not yet run for site '{site}'."
-            )
+            raise RuntimeError(f"fit_empirical() not yet run for site '{site}'.")
         if anchor_date is None:
             anchor_date = self._get_site_series(site).index[-1]
-        fan = self._stlets_forecasters[site].forecast(
-            anchor_date, n_days=n_days
-        )
-        fan.attrs.update(
-            {"site": site, "variable": self.variable, "method": "stl_ets"}
-        )
+        fan = self._stlets_forecasters[site].forecast(anchor_date, n_days=n_days)
+        fan.attrs.update({"site": site, "variable": self.variable, "method": "stl_ets"})
         return fan
 
     def forecast_lstm(
@@ -1350,8 +1537,7 @@ class Forecaster:
     ) -> pd.DataFrame:
         if site not in self._lstm_models or not self._lstm_models[site]._is_trained:
             raise RuntimeError(
-                f"LSTM not trained for '{site}'. "
-                f"Call fit_lstm('{site}') first."
+                f"LSTM not trained for '{site}'. " f"Call fit_lstm('{site}') first."
             )
 
         dc = self._decomposers[site]
@@ -1376,9 +1562,7 @@ class Forecaster:
         if n_days < FORECAST_HORIZON:
             lstm_resid = lstm_resid[:, :n_days]
         elif n_days > FORECAST_HORIZON:
-            pad = np.repeat(
-                lstm_resid[:, -1:], n_days - FORECAST_HORIZON, axis=1
-            )
+            pad = np.repeat(lstm_resid[:, -1:], n_days - FORECAST_HORIZON, axis=1)
             lstm_resid = np.concatenate([lstm_resid, pad], axis=1)
 
         trend = dc.trend_at(future_dates)
@@ -1393,9 +1577,7 @@ class Forecaster:
             rows.append(row)
 
         fan = pd.DataFrame(rows).set_index("date").clip(lower=0.0)
-        fan.attrs.update(
-            {"site": site, "variable": self.variable, "method": "lstm"}
-        )
+        fan.attrs.update({"site": site, "variable": self.variable, "method": "lstm"})
         return fan
 
     def forecast(
@@ -1405,16 +1587,9 @@ class Forecaster:
         anchor_date: Optional[pd.Timestamp] = None,
     ) -> pd.DataFrame:
         """Auto-select: LSTM if trained, else empirical."""
-        if (
-            site in self._lstm_models
-            and self._lstm_models[site]._is_trained
-        ):
-            return self.forecast_lstm(
-                site, n_days=n_days, anchor_date=anchor_date
-            )
-        return self.forecast_empirical(
-            site, n_days=n_days, anchor_date=anchor_date
-        )
+        if site in self._lstm_models and self._lstm_models[site]._is_trained:
+            return self.forecast_lstm(site, n_days=n_days, anchor_date=anchor_date)
+        return self.forecast_empirical(site, n_days=n_days, anchor_date=anchor_date)
 
     def evaluate(
         self,
@@ -1445,22 +1620,16 @@ class Forecaster:
 
             if method == "lstm" and site in self._lstm_models:
                 fan = self.forecast_lstm(site, n_days=1, anchor_date=anchor)
+            elif method == "nbeats" and site in self._nbeats_models:
+                fan = self.forecast_nbeats(site, n_days=1, anchor_date=anchor)
             elif method == "persistence":
-                fan = self.forecast_persistence(
-                    site, n_days=1, anchor_date=anchor
-                )
+                fan = self.forecast_persistence(site, n_days=1, anchor_date=anchor)
             elif method == "ets":
-                fan = self.forecast_ets(
-                    site, n_days=1, anchor_date=anchor
-                )
+                fan = self.forecast_ets(site, n_days=1, anchor_date=anchor)
             elif method == "stl_ets":
-                fan = self.forecast_stl_ets(
-                    site, n_days=1, anchor_date=anchor
-                )
+                fan = self.forecast_stl_ets(site, n_days=1, anchor_date=anchor)
             else:
-                fan = self.forecast_empirical(
-                    site, n_days=1, anchor_date=anchor
-                )
+                fan = self.forecast_empirical(site, n_days=1, anchor_date=anchor)
 
             for q, lbl in zip(QUANTILES, QUANTILE_LABELS):
                 pred = float(fan.iloc[0][lbl])
@@ -1491,28 +1660,24 @@ class Forecaster:
         methods = ["persistence", "ets", "stl_ets", "empirical"]
         if site in self._lstm_models and self._lstm_models[site]._is_trained:
             methods.append("lstm")
+        if site in self._nbeats_models and self._nbeats_models[site]._is_trained:
+            methods.append("nbeats")
 
         rows = []
         for method in methods:
-            eval_df = self.evaluate(
-                site, method=method, test_days=test_days
-            )
+            eval_df = self.evaluate(site, method=method, test_days=test_days)
             for lbl, grp in eval_df.groupby("label"):
                 rows.append(
                     {
                         "method": method,
                         "quantile": lbl,
-                        "mean_pinball": round(
-                            grp["pinball_loss"].mean(), 6
-                        ),
+                        "mean_pinball": round(grp["pinball_loss"].mean(), 6),
                     }
                 )
 
         return (
             pd.DataFrame(rows)
-            .pivot(
-                index="quantile", columns="method", values="mean_pinball"
-            )
+            .pivot(index="quantile", columns="method", values="mean_pinball")
             .reset_index()
         )
 
@@ -1530,20 +1695,18 @@ class Forecaster:
         methods = ["persistence", "ets", "stl_ets", "empirical"]
         if site in self._lstm_models and self._lstm_models[site]._is_trained:
             methods.append("lstm")
+        if site in self._nbeats_models and self._nbeats_models[site]._is_trained:
+            methods.append("nbeats")
 
         eval_results = {}
         for method in methods:
             try:
-                eval_results[method] = self.evaluate(
-                    site, method=method, test_days=test_days
-                )
+                eval_results[method] = self.evaluate(site, method=method, test_days=test_days)
             except Exception as e:
                 logger.warning("DM eval failed for %s: %s", method, e)
 
         if reference_method not in eval_results:
-            raise ValueError(
-                f"reference_method '{reference_method}' evaluation failed."
-            )
+            raise ValueError(f"reference_method '{reference_method}' evaluation failed.")
 
         dm_table = run_diebold_mariano(
             eval_results,
@@ -1581,6 +1744,7 @@ class Forecaster:
 # Convenience builders
 # ---------------------------------------------------------------------------
 
+
 def build_forecasters(
     df: pd.DataFrame,
     model_dir: Optional[Path] = None,
@@ -1603,6 +1767,7 @@ def build_forecasters(
 # ForecastBundle
 # ---------------------------------------------------------------------------
 
+
 class ForecastBundle:
     """
     Joint operational forecast for one site with solar-wind correlation.
@@ -1624,18 +1789,12 @@ class ForecastBundle:
         n_days: int = FORECAST_HORIZON,
         anchor_date: Optional[pd.Timestamp] = None,
     ) -> pd.DataFrame:
-        sol_fan = self._sf.forecast(
-            site, n_days=n_days, anchor_date=anchor_date
-        )
-        wnd_fan = self._wf.forecast(
-            site, n_days=n_days, anchor_date=anchor_date
-        )
+        sol_fan = self._sf.forecast(site, n_days=n_days, anchor_date=anchor_date)
+        wnd_fan = self._wf.forecast(site, n_days=n_days, anchor_date=anchor_date)
         sol_fan.columns = [f"solar_{c}" for c in sol_fan.columns]
         wnd_fan.columns = [f"wind_{c}" for c in wnd_fan.columns]
         bundle = sol_fan.join(wnd_fan)
-        bundle["rho"] = [
-            self._corr.get(site, dt.month) for dt in bundle.index
-        ]
+        bundle["rho"] = [self._corr.get(site, dt.month) for dt in bundle.index]
         bundle.attrs.update({"site": site, "n_days": n_days})
         return bundle
 
@@ -1643,6 +1802,7 @@ class ForecastBundle:
 # ---------------------------------------------------------------------------
 # Classical baselines — ETS and STL+ETS
 # ---------------------------------------------------------------------------
+
 
 class ETSForecaster:
     """
@@ -1664,6 +1824,7 @@ class ETSForecaster:
 
     def fit(self, series: pd.Series) -> "ETSForecaster":
         from statsmodels.tsa.holtwinters import ExponentialSmoothing
+
         self._series = series.copy()
         try:
             model = ExponentialSmoothing(
@@ -1703,6 +1864,7 @@ class ETSForecaster:
         try:
             import warnings
             from statsmodels.tsa.holtwinters import ExponentialSmoothing
+
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 if self._method == "holt_winters":
@@ -1801,16 +1963,14 @@ class STLETSForecaster:
             tail = trend.tail(90)
             x = np.arange(len(tail))
             coeffs = np.polyfit(x, tail.values, 1)
-            future_trend = np.array([
-                coeffs[0] * (len(tail) + i) + coeffs[1]
-                for i in range(n_days)
-            ])
+            future_trend = np.array(
+                [coeffs[0] * (len(tail) + i) + coeffs[1] for i in range(n_days)]
+            )
 
             # Project seasonal by period
-            future_seasonal = np.array([
-                float(seasonal.iloc[-(period - (i % period))])
-                for i in range(n_days)
-            ])
+            future_seasonal = np.array(
+                [float(seasonal.iloc[-(period - (i % period))]) for i in range(n_days)]
+            )
 
             # ETS on residuals
             try:
@@ -1825,22 +1985,16 @@ class STLETSForecaster:
             except Exception:
                 future_resid = np.zeros(n_days)
 
-            point_forecasts = np.clip(
-                future_trend + future_seasonal + future_resid, 0, None
-            )
+            point_forecasts = np.clip(future_trend + future_seasonal + future_resid, 0, None)
 
         except Exception:
             # Fallback: use SignalDecomposer trend+seasonal + last residual
             trend_vals = self._dc.trend_at(future_dates)
             seasonal_vals = self._dc.seasonal_at(future_dates)
             last_resid = float(
-                self._dc.residuals[
-                    self._dc.residuals.index <= anchor_date
-                ].iloc[-1]
+                self._dc.residuals[self._dc.residuals.index <= anchor_date].iloc[-1]
             )
-            point_forecasts = np.clip(
-                trend_vals + seasonal_vals + last_resid, 0, None
-            )
+            point_forecasts = np.clip(trend_vals + seasonal_vals + last_resid, 0, None)
 
         rows = []
         for i, dt in enumerate(future_dates):
@@ -1857,6 +2011,7 @@ class STLETSForecaster:
 # ---------------------------------------------------------------------------
 # Diebold-Mariano test
 # ---------------------------------------------------------------------------
+
 
 def diebold_mariano_test(
     losses_a: np.ndarray,
@@ -1892,9 +2047,7 @@ def diebold_mariano_test(
     gamma_0 = np.var(d, ddof=1)
     nw_var = gamma_0
     for lag in range(1, h):
-        gamma_lag = np.mean(
-            (d[lag:] - mean_d) * (d[:-lag] - mean_d)
-        )
+        gamma_lag = np.mean((d[lag:] - mean_d) * (d[:-lag] - mean_d))
         nw_var += 2 * (1 - lag / h) * gamma_lag
 
     if nw_var <= 0:
@@ -1932,9 +2085,7 @@ def run_diebold_mariano(
     ref = reference_method
 
     if ref not in methods:
-        raise ValueError(
-            f"reference_method '{ref}' not in eval_results keys: {methods}"
-        )
+        raise ValueError(f"reference_method '{ref}' not in eval_results keys: {methods}")
 
     ref_df = eval_results[ref]
     ref_q = ref_df[np.isclose(ref_df["quantile"], quantile)]
@@ -1959,26 +2110,30 @@ def run_diebold_mariano(
             other_losses.loc[common].values,
             h=1,
         )
-        rows.append({
-            "method_a": ref,
-            "method_b": method,
-            "quantile": quantile,
-            "dm_statistic": round(dm_stat, 4),
-            "p_value": round(p_val, 4),
-            "significant": "yes" if p_val < 0.05 else "no",
-            "winner": ref if dm_stat < 0 else method,
-        })
+        rows.append(
+            {
+                "method_a": ref,
+                "method_b": method,
+                "quantile": quantile,
+                "dm_statistic": round(dm_stat, 4),
+                "p_value": round(p_val, 4),
+                "significant": "yes" if p_val < 0.05 else "no",
+                "winner": ref if dm_stat < 0 else method,
+            }
+        )
 
     return pd.DataFrame(rows)
-  # -------------------------------------------------------------------------------
+
+
+# -------------------------------------------------------------------------------
 def select_best_model(compare_df: pd.DataFrame, candidates=("lstm", "nbeats")) -> str:
-  """
-  Pick the winner between two canonical models using MAPE/RMSE and
-  stability (lowest variance) across the test-phase evaluation,
-  per your resubmission criterion: smallest AND most stable error.
-  Expects a DataFrame with columns: method, mape, rmse, error_std.
-  """
-  sub = compare_df[compare_df["method"].isin(candidates)].copy()
-  sub["rank_score"] = sub["rmse"].rank() + sub["mape"].rank() + sub["error_std"].rank()
-  winner = sub.sort_values("rank_score").iloc[0]["method"]
-  return winner
+    """
+    Pick the winner between two canonical models using MAPE/RMSE and
+    stability (lowest variance) across the test-phase evaluation,
+    per your resubmission criterion: smallest AND most stable error.
+    Expects a DataFrame with columns: method, mape, rmse, error_std.
+    """
+    sub = compare_df[compare_df["method"].isin(candidates)].copy()
+    sub["rank_score"] = sub["rmse"].rank() + sub["mape"].rank() + sub["error_std"].rank()
+    winner = sub.sort_values("rank_score").iloc[0]["method"]
+    return winner
