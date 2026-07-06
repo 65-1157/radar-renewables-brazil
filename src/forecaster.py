@@ -851,7 +851,199 @@ class SiteCorrelationEstimator:
     def get(self, site: str, month: int) -> float:
         season = self._season(month)
         return self.correlations.get(site, {}).get(season, 0.0)
+# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Phase 3 — N-BEATS (neuralforecast), same rigor as the LSTM path
+# ---------------------------------------------------------------------------
 
+def _try_import_neuralforecast() -> bool:
+    try:
+        import neuralforecast  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+class _NBEATSModel:
+    """
+    N-BEATS quantile forecaster (via neuralforecast) with Optuna
+    hyperparameter search, patience-based early stopping, and
+    model-agnostic SHAP/LIME explanations on the input residual window.
+    """
+
+    def __init__(
+        self,
+        input_window: int = DEFAULT_INPUT_WINDOW,
+        horizon: int = FORECAST_HORIZON,
+        max_steps: int = 500,
+    ) -> None:
+        if not _try_import_neuralforecast():
+            raise ImportError(
+                "neuralforecast is required. Install with: pip install neuralforecast"
+            )
+        self.input_window = input_window
+        self.horizon = horizon
+        self.max_steps = max_steps
+        self.best_params: Dict = {}
+        self._nf = None
+        self._site: Optional[str] = None
+        self.train_losses: List[float] = []
+        self.val_losses: List[float] = []
+        self._is_trained: bool = False
+
+    def _build_model(self, input_size, learning_rate, n_blocks, mlp_width, patience):
+        from neuralforecast.models import NBEATS
+        from neuralforecast.losses.pytorch import MQLoss
+
+        return NBEATS(
+            h=self.horizon,
+            input_size=input_size,
+            loss=MQLoss(quantiles=QUANTILES),
+            learning_rate=learning_rate,
+            n_blocks=[n_blocks, n_blocks, n_blocks],
+            mlp_units=[[mlp_width, mlp_width]] * 3,
+            max_steps=self.max_steps,
+            early_stop_patience_steps=patience,   # <-- patience, mirrors LSTM
+            val_check_steps=10,
+            scaler_type="standard",
+            accelerator="gpu",
+        )
+
+    def _to_nf_frame(self, residuals: np.ndarray, site: str) -> pd.DataFrame:
+        dates = pd.date_range("2000-01-01", periods=len(residuals), freq="D")
+        return pd.DataFrame({"unique_id": site, "ds": dates, "y": residuals.astype(float)})
+
+    # ------------------------------------------------------------------
+    def tune(
+        self,
+        residuals: np.ndarray,
+        site: str,
+        n_trials: int = 20,
+        n_windows: int = 3,
+        patience: int = 10,
+        verbose: bool = True,
+    ) -> Dict:
+        """
+        Optuna search over N-BEATS hyperparameters (input_size multiple,
+        learning_rate, stack depth, MLP width), scored on walk-forward
+        cross-validation. Patience is enforced inside each trial via
+        early_stop_patience_steps, same principle as the LSTM's
+        patience_per_trial.
+        """
+        try:
+            import optuna
+            from neuralforecast import NeuralForecast
+        except ImportError:
+            raise ImportError("Install with: pip install optuna neuralforecast")
+
+        optuna.logging.set_verbosity(
+            optuna.logging.INFO if verbose else optuna.logging.WARNING
+        )
+        nf_df = self._to_nf_frame(residuals, site)
+
+        def objective(trial: "optuna.Trial") -> float:
+            mult = trial.suggest_categorical("input_window_mult", [2, 3, 4, 6])
+            lr = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
+            n_blocks = trial.suggest_int("n_blocks", 1, 3)
+            mlp_width = trial.suggest_categorical("mlp_units_width", [128, 256, 512])
+
+            model = self._build_model(mult * self.horizon, lr, n_blocks, mlp_width, patience)
+            nf = NeuralForecast(models=[model], freq="D")
+            try:
+                cv_df = nf.cross_validation(nf_df, n_windows=n_windows, step_size=self.horizon)
+            except Exception as exc:
+                logger.warning("N-BEATS trial failed: %s", exc)
+                raise optuna.exceptions.TrialPruned()
+
+            q_cols = [c for c in cv_df.columns if c not in ("unique_id", "ds", "cutoff", "y")]
+            if not q_cols:
+                raise optuna.exceptions.TrialPruned()
+            q50_col = q_cols[len(QUANTILES) // 2]
+            return pinball_loss_numpy(
+                cv_df["y"].values, np.clip(cv_df[q50_col].values, 0, None), 0.50
+            )
+
+        study = optuna.create_study(
+            direction="minimize",
+            sampler=optuna.samplers.TPESampler(seed=42),
+            pruner=optuna.pruners.MedianPruner(n_startup_trials=5),
+        )
+        study.optimize(objective, n_trials=n_trials)
+
+        best = dict(study.best_params)
+        best["input_size"] = best.pop("input_window_mult") * self.horizon
+        self.best_params = best
+        self.input_window = best["input_size"]
+        logger.info("N-BEATS Optuna best params: %s", best)
+        logger.info("N-BEATS Optuna best val pinball (Q50): %.5f", study.best_value)
+        return best
+
+    # ------------------------------------------------------------------
+    def fit(self, residuals: np.ndarray, site: str, patience: int = 10, verbose: bool = True):
+        """Train final N-BEATS model with Optuna best params (or defaults)."""
+        from neuralforecast import NeuralForecast
+
+        p = self.best_params or {
+            "input_size": self.input_window, "learning_rate": 1e-3,
+            "n_blocks": 2, "mlp_units_width": 256,
+        }
+        model = self._build_model(p["input_size"], p["learning_rate"], p["n_blocks"], p["mlp_units_width"], patience)
+        nf_df = self._to_nf_frame(residuals, site)
+        self._nf = NeuralForecast(models=[model], freq="D")
+        self._nf.fit(nf_df, val_size=self.horizon * 3)
+        self._site = site
+        self._is_trained = True
+        return self.train_losses, self.val_losses
+
+    # ------------------------------------------------------------------
+    def _predict_fn(self, X: np.ndarray) -> np.ndarray:
+        """Model-agnostic wrapper for SHAP/LIME: X is (n_samples, input_window)."""
+        preds = []
+        for row in X:
+            df = self._to_nf_frame(row, self._site)
+            fcst = self._nf.predict(df=df)
+            q_cols = [c for c in fcst.columns if c not in ("unique_id", "ds")]
+            preds.append(float(fcst[q_cols[len(QUANTILES) // 2]].iloc[0]))
+        return np.array(preds)
+
+    def compute_shap(self, residual_windows: np.ndarray, n_background: int = 30, n_explain: int = 20) -> np.ndarray:
+        """
+        Model-agnostic SHAP via KernelExplainer, since NeuralForecast
+        doesn't expose a plain forward() like the hand-rolled LSTM.
+        NOTE: test this against your installed neuralforecast version —
+        nf.predict(df=...) semantics can vary slightly across versions.
+        """
+        try:
+            import shap
+        except ImportError:
+            raise ImportError("Install with: pip install shap")
+        if not self._is_trained:
+            raise RuntimeError("Call fit() before compute_shap().")
+
+        background = residual_windows[:n_background]
+        X_exp = residual_windows[n_background:n_background + n_explain]
+        explainer = shap.KernelExplainer(self._predict_fn, background)
+        shap_vals = explainer.shap_values(X_exp, nsamples=100)
+        importance = np.mean(np.abs(shap_vals), axis=0)
+        self.shap_importance = importance
+        logger.info("N-BEATS SHAP top-3 lags: %s", np.argsort(importance)[::-1][:3].tolist())
+        return importance
+
+    def explain_lime(self, residual_windows: np.ndarray, instance: np.ndarray, num_features: int = 10):
+        try:
+            from lime import lime_tabular
+        except ImportError:
+            raise ImportError("Install with: pip install lime")
+        if not self._is_trained:
+            raise RuntimeError("Call fit() before explain_lime().")
+
+        explainer = lime_tabular.LimeTabularExplainer(
+            residual_windows, mode="regression",
+            feature_names=[f"lag_{i}" for i in range(residual_windows.shape[1])],
+        )
+        explanation = explainer.explain_instance(instance, self._predict_fn, num_features=num_features)
+        logger.info("N-BEATS LIME top feature: %s", explanation.as_list()[0][0])
+        return explanation
 
 # ---------------------------------------------------------------------------
 # Top-level Forecaster
@@ -1087,6 +1279,46 @@ class Forecaster:
         return self._lstm_models[site].explain_forecast_lime(
             context, quantile_idx, horizon_idx, num_features
         )
+
+  # ------------------------------------------------------------------------------
+    def tune_nbeats(self, site: str, n_trials: int = 20, patience: int = 10,
+                         verbose: bool = True, force_retune: bool = False) -> Dict:
+            if not self._empirical_fitted:
+                raise RuntimeError("Call fit_empirical() before tune_nbeats().")
+            if not hasattr(self, "_nbeats_models"):
+                self._nbeats_models: Dict[str, "_NBEATSModel"] = {}
+    
+            params_path = self._model_dir / f"optuna_nbeats_{self.variable}_{site.replace(' ', '_')}.npy"
+            model = _NBEATSModel()
+    
+            if params_path.exists() and not force_retune:
+                best_params = dict(np.load(params_path, allow_pickle=True).item())
+                model.best_params = best_params
+                model.input_window = best_params["input_size"]
+                self._nbeats_models[site] = model
+                return best_params
+    
+            residuals = self._decomposers[site].residuals.values
+            best_params = model.tune(residuals, site, n_trials=n_trials, patience=patience, verbose=verbose)
+            np.save(params_path, best_params)
+            self._nbeats_models[site] = model
+            return best_params
+    
+    def fit_nbeats(self, site: str, patience: int = 10, verbose: bool = True):
+        if not hasattr(self, "_nbeats_models"):
+            self._nbeats_models = {}
+        if site not in self._nbeats_models:
+            self._nbeats_models[site] = _NBEATSModel()
+        residuals = self._decomposers[site].residuals.values
+        return self._nbeats_models[site].fit(residuals, site, patience=patience, verbose=verbose)
+    
+    def compute_shap_nbeats(self, site: str, n_background: int = 30, n_explain: int = 20) -> np.ndarray:
+        residuals = self._decomposers[site].residuals.values
+        iw = self._nbeats_models[site].input_window
+        windows = np.array([residuals[i:i+iw] for i in range(len(residuals) - iw)])
+        return self._nbeats_models[site].compute_shap(windows, n_background, n_explain)
+
+  # ------------------------------------------------------------------------------
 
     def forecast_empirical(
         self,
@@ -1794,3 +2026,15 @@ def run_diebold_mariano(
         })
 
     return pd.DataFrame(rows)
+  # -------------------------------------------------------------------------------
+def select_best_model(compare_df: pd.DataFrame, candidates=("lstm", "nbeats")) -> str:
+  """
+  Pick the winner between two canonical models using MAPE/RMSE and
+  stability (lowest variance) across the test-phase evaluation,
+  per your resubmission criterion: smallest AND most stable error.
+  Expects a DataFrame with columns: method, mape, rmse, error_std.
+  """
+  sub = compare_df[compare_df["method"].isin(candidates)].copy()
+  sub["rank_score"] = sub["rmse"].rank() + sub["mape"].rank() + sub["error_std"].rank()
+  winner = sub.sort_values("rank_score").iloc[0]["method"]
+  return winner
