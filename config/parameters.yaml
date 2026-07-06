@@ -1,3 +1,10 @@
+# ── Economics (Added for PSTEF MOPSO) ─────────────────────
+economics:
+  cost_pv_m2: 250.0          # USD per square meter of solar
+  cost_wind_turbine: 100000.0 # USD per 10kW turbine installation
+  cost_battery_kwh: 400.0    # USD per kWh of Li-ion battery
+  project_life_years: 20
+  discount_rate: 0.08
 # ── Data paths ────────────────────────────────────────────
 data:
   raw_path: "../ai-renewable-energy-data-agent/data/processed/renewable_energy_brazil_coast_daily.csv"
