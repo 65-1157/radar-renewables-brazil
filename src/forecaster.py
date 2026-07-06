@@ -891,20 +891,20 @@ class _NBEATSModel:
         self.val_losses: List[float] = []
         self._is_trained: bool = False
 
-    def _build_model(self, input_size, learning_rate, n_blocks, mlp_width, patience):
+    def _build_model(self, input_size, learning_rate, n_blocks, mlp_width,
+                      patience=None, max_steps=None):
         from neuralforecast.models import NBEATS
         from neuralforecast.losses.pytorch import MQLoss
-
-        return NBEATS(
+        import torch
+    
+        kwargs = dict(
             h=self.horizon,
             input_size=input_size,
             loss=MQLoss(quantiles=QUANTILES),
             learning_rate=learning_rate,
             n_blocks=[n_blocks, n_blocks, n_blocks],
             mlp_units=[[mlp_width, mlp_width]] * 3,
-            max_steps=self.max_steps,
-            early_stop_patience_steps=patience,   # <-- patience, mirrors LSTM
-            val_check_steps=10,
+            max_steps=max_steps or self.max_steps,
             scaler_type="standard",
             accelerator="gpu" if torch.cuda.is_available() else "cpu",
         )
