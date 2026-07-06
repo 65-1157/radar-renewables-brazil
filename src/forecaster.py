@@ -971,6 +971,13 @@ class _NBEATSModel:
         )
         study.optimize(objective, n_trials=n_trials)
 
+        completed = [t for t in study.trials if t.state.name == "COMPLETE"]
+        if not completed:
+            raise RuntimeError(
+                "N-BEATS Optuna study: all trials failed or were pruned — "
+                "check the warnings above before proceeding."
+            )
+
         best = dict(study.best_params)
         best["input_size"] = best.pop("input_window_mult") * self.horizon
         self.best_params = best
