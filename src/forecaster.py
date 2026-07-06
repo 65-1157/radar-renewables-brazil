@@ -1083,7 +1083,7 @@ class Forecaster:
         self._df = df.copy()
         self._df["date"] = pd.to_datetime(self._df["date"])
 
-        self._model_dir = model_dir or Path("outputs/models")
+        self._model_dir = Path(model_dir) if model_dir is not None else Path("outputs/models")
         self._model_dir.mkdir(parents=True, exist_ok=True)
 
         self._decomposers: Dict[str, SignalDecomposer] = {}
