@@ -931,13 +931,17 @@ class _NBEATSModel:
             scaler_type="standard",
             accelerator="gpu" if torch.cuda.is_available() else "cpu",
         )
-        # patience=None on purpose during Optuna/CV trials: Lightning's
-        # EarlyStopping cannot reliably see `ptl/val_loss` inside per-window
-        # cross_validation() refits, so early stopping is only attached to
-        # the final single-split fit() call below.
+        # early_stop_patience_steps is set EXPLICITLY in both branches below
+        # (never omitted) so behavior does not depend on whatever default
+        # value a given neuralforecast version ships with. -1 disables
+        # early stopping outright; this is what we want during Optuna/CV
+        # trials, since Lightning's EarlyStopping cannot reliably see
+        # `ptl/val_loss` inside per-window cross_validation() refits.
         if patience is not None:
             kwargs["early_stop_patience_steps"] = patience
             kwargs["val_check_steps"] = 10
+        else:
+            kwargs["early_stop_patience_steps"] = -1
         if callbacks:
             kwargs["trainer_kwargs"] = {"callbacks": callbacks}
         return NBEATS(**kwargs)
@@ -982,6 +986,10 @@ class _NBEATSModel:
 
             model = self._build_model(
                 mult * self.horizon, lr, n_blocks, mlp_width, patience=None
+            )
+            logger.info(
+                "Trial model early_stop_patience_steps=%s (expect -1)",
+                getattr(model, "early_stop_patience_steps", "MISSING_ATTR"),
             )
             nf = NeuralForecast(models=[model], freq="D")
             try:
@@ -2137,3 +2145,4 @@ def select_best_model(compare_df: pd.DataFrame, candidates=("lstm", "nbeats")) -
     sub["rank_score"] = sub["rmse"].rank() + sub["mape"].rank() + sub["error_std"].rank()
     winner = sub.sort_values("rank_score").iloc[0]["method"]
     return winner
+
