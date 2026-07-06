@@ -808,3 +808,81 @@ def plot_dispatch_renewable_fraction(dispatch_table: pd.DataFrame) -> None:
                  y=1.02)
     plt.tight_layout()
     save(fig, "21_dispatch_renewable.png")
+
+"""
+Additions for visualiser.py
+=============================
+Appends MOPSO Pareto Front and Monte Carlo Risk visualizations to the existing 
+high-resolution (600 DPI) plotting pipeline.
+"""
+
+def plot_pareto_front(pareto_df: pd.DataFrame, site: str, best_system: pd.Series = None) -> None:
+    """
+    Generates the MOPSO Pareto Front scatter plot.
+    This is the core figure required by IEEE optimization reviewers.
+    """
+    fig, ax = plt.subplots(figsize=(8, 6))
+    
+    # Plot all optimized swarm particles
+    ax.scatter(
+        pareto_df['Diesel_Litres'], 
+        pareto_df['LCOE_USD'], 
+        color=SITE_COLORS.get(site, "#1f77b4"), 
+        alpha=0.6, 
+        edgecolors='w',
+        s=60,
+        label="Pareto Optimal Solutions"
+    )
+    
+    # Highlight the single system chosen by AHP-TOPSIS
+    if best_system is not None:
+        ax.scatter(
+            best_system['Diesel_Litres'], 
+            best_system['LCOE_USD'], 
+            color='red', 
+            marker='*', 
+            s=200, 
+            edgecolors='black',
+            label="AHP-TOPSIS Strategic Choice"
+        )
+        
+    ax.set_title(f"MOPSO Pareto Front: {site}", fontsize=14, fontweight='bold')
+    ax.set_xlabel("Lifecycle Diesel Consumption (Litres)", fontsize=12)
+    ax.set_ylabel("Levelized Cost of Energy (USD/kWh)", fontsize=12)
+    ax.grid(True, linestyle='--', alpha=0.5)
+    ax.legend(fontsize=10)
+    
+    save(fig, f"pareto_front_{site.replace(' ', '_')}.png")
+
+def plot_monte_carlo_risk(sim_lcoe_results: np.ndarray, budget_cap: float, site: str) -> None:
+    """
+    Generates a histogram of the Monte Carlo simulations.
+    Proves to the reviewers that the chosen system survives stochastic uncertainties.
+    """
+    fig, ax = plt.subplots(figsize=(8, 6))
+    
+    # Plot the distribution of the 10,000 simulated project costs
+    n, bins, patches = ax.hist(
+        sim_lcoe_results, 
+        bins=50, 
+        color='gray', 
+        alpha=0.7, 
+        edgecolor='black'
+    )
+    
+    # Color code the histogram based on success (under budget) vs failure (over budget)
+    for i in range(len(patches)):
+        if bins[i] > budget_cap:
+            patches[i].set_facecolor('#d62728') # Red for failure
+        else:
+            patches[i].set_facecolor('#2ca02c') # Green for success
+            
+    # Add vertical line for the budget cap
+    ax.axvline(budget_cap, color='black', linestyle='dashed', linewidth=2, label=f'Budget Cap (${budget_cap:.4f})')
+    
+    ax.set_title(f"Monte Carlo Economic Resilience: {site}", fontsize=14, fontweight='bold')
+    ax.set_xlabel("Simulated LCOE under Uncertainty (USD/kWh)", fontsize=12)
+    ax.set_ylabel("Frequency (10,000 Scenarios)", fontsize=12)
+    ax.legend(fontsize=10)
+    
+    save(fig, f"monte_carlo_risk_{site.replace(' ', '_')}.png")
