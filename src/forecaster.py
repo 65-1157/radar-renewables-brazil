@@ -2139,14 +2139,31 @@ class Forecaster:
             anchor = series.index[cut_idx + step - 1]
             true_val = float(series.iloc[cut_idx + step])
 
-            if method == "lstm" and site in self._lstm_models:
+            if method == "lstm":
+                if site not in self._lstm_models or not self._lstm_models[site]._is_trained:
+                    raise RuntimeError(
+                        f"evaluate(method='lstm') requested for '{site}' but no "
+                        f"trained LSTM is loaded for it in this session. This used "
+                        f"to silently fall back to empirical forecasts instead — "
+                        f"changed to raise explicitly, since that silent substitution "
+                        f"could mislabel empirical results as 'lstm' in comparison "
+                        f"tables without any warning. Call fit_lstm('{site}') first, "
+                        f"or check that CELL 10 actually completed for this "
+                        f"site/variable in this session."
+                    )
                 fan = self.forecast_lstm(site, n_days=1, anchor_date=anchor)
-            elif method == "nbeats" and nbeats_wf is not None:
+            elif method == "nbeats":
+                if site not in self._nbeats_models or not self._nbeats_models[site]._is_trained:
+                    raise RuntimeError(
+                        f"evaluate(method='nbeats') requested for '{site}' but no "
+                        f"trained N-BEATS is loaded for it in this session. Call "
+                        f"fit_nbeats('{site}') first, or check that CELL 11 actually "
+                        f"completed for this site/variable in this session."
+                    )
                 target_date = series.index[cut_idx + step]
-                if target_date in nbeats_wf.index:
+                if nbeats_wf is not None and target_date in nbeats_wf.index:
                     fan = nbeats_wf.loc[[target_date]]
                 else:
-                    # fallback for any date the batched CV didn't cover
                     fan = self.forecast_nbeats(site, n_days=1, anchor_date=anchor)
             elif method in ("ets", "stl_ets") and baseline_wf is not None:
                 target_date = series.index[cut_idx + step]
@@ -2806,3 +2823,42 @@ def select_best_model(compare_df: pd.DataFrame, candidates=("lstm", "nbeats")) -
     sub["rank_score"] = sub["rmse"].rank() + sub["mape"].rank() + sub["error_std"].rank()
     winner = sub.sort_values("rank_score").iloc[0]["method"]
     return winner
+
+
+def preflight_check_trained_models(
+    forecasters: Dict[str, "Forecaster"], sites: List[str]
+) -> pd.DataFrame:
+    """
+    Run BEFORE any expensive evaluation loop (e.g. CELL 12). Checks, in
+    under a second, whether both LSTM and N-BEATS are actually trained
+    and loaded in THIS session's memory for every variable/site combo —
+    the exact gap that caused a 60-minute CELL 12 run to fail at combo
+    11/12 with "reference_method 'lstm' evaluation failed", instead of
+    failing in the first second with a clear report of what's missing.
+
+    Returns a DataFrame with columns: variable, site, lstm_trained,
+    nbeats_trained, ok.
+    """
+    rows = []
+    for variable, fcast in forecasters.items():
+        for site in sites:
+            lstm_ok = (
+                site in fcast._lstm_models and fcast._lstm_models[site]._is_trained
+            )
+            nbeats_ok = (
+                site in fcast._nbeats_models and fcast._nbeats_models[site]._is_trained
+            )
+            rows.append({
+                "variable": variable, "site": site,
+                "lstm_trained": lstm_ok, "nbeats_trained": nbeats_ok,
+                "ok": lstm_ok and nbeats_ok,
+            })
+    report = pd.DataFrame(rows)
+
+    missing = report[~report["ok"]]
+    if not missing.empty:
+        logger.warning(
+            "preflight_check_trained_models: %d/%d combos missing a trained "
+            "model:\n%s", len(missing), len(report), missing.to_string(index=False),
+        )
+    return report
