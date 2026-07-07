@@ -440,37 +440,47 @@ class _QuantileLSTMModel:
             best_val = math.inf
             patience_counter = 0
 
-            for epoch in range(1, epochs_per_trial + 1):
-                net.train()
-                for xb, yb in loader:
-                    optim.zero_grad()
-                    preds = net(xb)
-                    loss = self._pinball_loss_torch(preds, yb.unsqueeze(1).expand_as(preds))
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
-                    optim.step()
+            try:
+                for epoch in range(1, epochs_per_trial + 1):
+                    net.train()
+                    for xb, yb in loader:
+                        optim.zero_grad()
+                        preds = net(xb)
+                        loss = self._pinball_loss_torch(preds, yb.unsqueeze(1).expand_as(preds))
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+                        optim.step()
 
-                net.eval()
-                with torch.no_grad():
-                    val_preds = net(X_val_t)
-                    val_loss = self._pinball_loss_torch(
-                        val_preds, Y_val_t.unsqueeze(1).expand_as(val_preds)
-                    )
-                vl = float(val_loss.item())
+                    net.eval()
+                    with torch.no_grad():
+                        val_preds = net(X_val_t)
+                        val_loss = self._pinball_loss_torch(
+                            val_preds, Y_val_t.unsqueeze(1).expand_as(val_preds)
+                        )
+                    vl = float(val_loss.item())
 
-                if vl < best_val:
-                    best_val = vl
-                    patience_counter = 0
-                else:
-                    patience_counter += 1
-                    if patience_counter >= patience_per_trial:
-                        break
+                    if vl < best_val:
+                        best_val = vl
+                        patience_counter = 0
+                    else:
+                        patience_counter += 1
+                        if patience_counter >= patience_per_trial:
+                            break
 
-                trial.report(vl, epoch)
-                if trial.should_prune():
-                    raise optuna.exceptions.TrialPruned()
+                    trial.report(vl, epoch)
+                    if trial.should_prune():
+                        raise optuna.exceptions.TrialPruned()
 
-            return best_val
+                return best_val
+            finally:
+                # 20 trials x 12 sites/vars accumulate ~240 short-lived
+                # nets/tensors if not explicitly released — matches the
+                # same cleanup added to the N-BEATS trial loop.
+                del net, optim, loader, ds, X_tr_t, Y_tr_t, X_val_t, Y_val_t
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         study = optuna.create_study(
             direction="minimize",
@@ -1540,14 +1550,25 @@ class Forecaster:
         future_dates = pd.date_range(
             start=anchor_date + pd.Timedelta(days=1), periods=FORECAST_HORIZON, freq="D"
         )
+        # N-BEATS is trained on RESIDUALS (same as the LSTM) — the model's
+        # raw output must have trend + seasonal added back to be on the
+        # same scale as actual solar/wind values. This step was previously
+        # missing here (present in forecast_lstm), meaning every prior
+        # N-BEATS evaluation compared residual-scale output against
+        # actual-scale ground truth.
+        trend = dc.trend_at(future_dates)
+        seasonal = dc.seasonal_at(future_dates)
+        base = trend + seasonal
+
         rows = []
         for i, dt in enumerate(future_dates[:n_days]):
             row = {"date": dt}
             for qi, lbl in enumerate(QUANTILE_LABELS):
                 col = q_cols[qi] if qi < len(q_cols) else q_cols[-1]
-                row[lbl] = (
+                resid_val = (
                     float(fcst[col].iloc[i]) if i < len(fcst) else float(fcst[col].iloc[-1])
                 )
+                row[lbl] = base[i] + resid_val
             rows.append(row)
 
         fan = pd.DataFrame(rows).set_index("date").clip(lower=0.0)
@@ -1674,6 +1695,83 @@ class Forecaster:
             return self.forecast_lstm(site, n_days=n_days, anchor_date=anchor_date)
         return self.forecast_empirical(site, n_days=n_days, anchor_date=anchor_date)
 
+    def _get_nbeats_walkforward(self, site: str, test_days: int = 90) -> pd.DataFrame:
+        """
+        One-shot walk-forward 1-day-ahead forecasts for N-BEATS, replacing
+        ~test_days separate NeuralForecast.predict() calls (each with its
+        own Lightning startup/device-log overhead) with a SINGLE
+        cross_validation() call against the already-fitted model
+        (use_fitted=True — no retraining). This is the single biggest
+        time-saver for N-BEATS evaluation across a full run of 6 sites x
+        2 variables. Result is cached per site.
+
+        NOTE: use_fitted=True cross-validation on an already-trained model
+        is a documented neuralforecast capability, but verify the row
+        count/columns look right the first time you run this against your
+        installed version before trusting it for final paper numbers.
+        """
+        if not hasattr(self, "_nbeats_eval_cache"):
+            self._nbeats_eval_cache: Dict[str, pd.DataFrame] = {}
+        cache_key = f"{site}_{test_days}"
+        if cache_key in self._nbeats_eval_cache:
+            return self._nbeats_eval_cache[cache_key]
+
+        model = self._nbeats_models[site]
+        dc = self._decomposers[site]
+        real_dates = dc.residuals.index  # real calendar DatetimeIndex, position i <-> synthetic day i
+        full_df = model._to_nf_frame(dc.residuals.values, site)
+
+        cv_df = model._nf.cross_validation(
+            full_df,
+            test_size=test_days,
+            step_size=1,
+            use_fitted=True,
+            refit=False,
+            use_init_models=False,
+        )
+        # One window per day; keep only the first forecasted day of each
+        # window (the 1-day-ahead prediction), matching the semantics
+        # evaluate() previously got from calling forecast_nbeats(n_days=1)
+        # once per day.
+        cv_df = cv_df.sort_values(["cutoff", "ds"])
+        first_per_cutoff = cv_df.groupby("cutoff", as_index=False).head(1).copy()
+
+        # _to_nf_frame() built the training series on FAKE dates starting
+        # "2000-01-01" (position 0 = first residual, position 1 = second,
+        # etc.) — NOT real calendar dates. cv_df["ds"] is therefore also on
+        # that fake timeline. Map each fake date back to the REAL calendar
+        # date by position before doing trend/seasonal lookup, which is
+        # indexed on real dates. Using the fake date directly here was the
+        # bug that produced near-zero, nonsense predictions.
+        synthetic_epoch = pd.Timestamp("2000-01-01")
+        positions = (pd.DatetimeIndex(first_per_cutoff["ds"]) - synthetic_epoch).days
+        valid = (positions >= 0) & (positions < len(real_dates))
+        if not valid.all():
+            logger.warning(
+                "%d/%d walk-forward rows had an out-of-range synthetic date "
+                "and were dropped.", (~valid).sum(), len(valid),
+            )
+        first_per_cutoff = first_per_cutoff.loc[valid].reset_index(drop=True)
+        positions = positions[valid]
+        real_future_dates = real_dates[positions]
+
+        trend = dc.trend_at(real_future_dates)
+        seasonal = dc.seasonal_at(real_future_dates)
+        base = trend + seasonal
+
+        q_cols = [c for c in cv_df.columns if c not in ("unique_id", "ds", "cutoff", "y")]
+        rows = []
+        for i, (_, r) in enumerate(first_per_cutoff.iterrows()):
+            row = {"date": real_future_dates[i]}
+            for qi, lbl in enumerate(QUANTILE_LABELS):
+                col = q_cols[qi] if qi < len(q_cols) else q_cols[-1]
+                row[lbl] = max(0.0, base[i] + float(r[col]))
+            rows.append(row)
+
+        result = pd.DataFrame(rows).set_index("date")
+        self._nbeats_eval_cache[cache_key] = result
+        return result
+
     def evaluate(
         self,
         site: str,
@@ -1682,7 +1780,7 @@ class Forecaster:
     ) -> pd.DataFrame:
         """
         Walk-forward pinball loss on last test_days of data.
-        method : "empirical" | "lstm" | "persistence"
+        method : "empirical" | "lstm" | "nbeats" | "persistence" | "ets" | "stl_ets"
         """
         series = self._get_site_series(site)
         n = len(series)
@@ -1697,14 +1795,24 @@ class Forecaster:
         cut_idx = n - test_days
         records = []
 
+        # N-BEATS: one batched call up front instead of test_days separate ones.
+        nbeats_wf = None
+        if method == "nbeats" and site in self._nbeats_models:
+            nbeats_wf = self._get_nbeats_walkforward(site, test_days=test_days)
+
         for step in range(test_days):
             anchor = series.index[cut_idx + step - 1]
             true_val = float(series.iloc[cut_idx + step])
 
             if method == "lstm" and site in self._lstm_models:
                 fan = self.forecast_lstm(site, n_days=1, anchor_date=anchor)
-            elif method == "nbeats" and site in self._nbeats_models:
-                fan = self.forecast_nbeats(site, n_days=1, anchor_date=anchor)
+            elif method == "nbeats" and nbeats_wf is not None:
+                target_date = series.index[cut_idx + step]
+                if target_date in nbeats_wf.index:
+                    fan = nbeats_wf.loc[[target_date]]
+                else:
+                    # fallback for any date the batched CV didn't cover
+                    fan = self.forecast_nbeats(site, n_days=1, anchor_date=anchor)
             elif method == "persistence":
                 fan = self.forecast_persistence(site, n_days=1, anchor_date=anchor)
             elif method == "ets":
