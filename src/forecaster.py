@@ -2,33 +2,73 @@
 src/forecaster.py
 =================
 Probabilistic 15-day operational forecasting for solar irradiance and
-hub-height wind speed at 6 Brazilian coastal radar stations.
+hub-height wind speed at 6 Brazilian coastal radar stations plus
+Ilha da Trindade.
 
 Architecture
 ------------
   x(t) = Trend(t) + Seasonal(t) + Noise(t)
 
   Trend    : centred moving average, 365-day window (edge-padded)
-  Seasonal : day-of-year mean profile estimated from 6-yr history
-  Noise    : residuals fed into a multi-quantile LSTM
+  Seasonal : day-of-year mean profile estimated from history
+  Noise    : residuals fed into TWO candidate models, compared and
+             selected per site/variable on walk-forward test error
+             (see select_best_model): a multi-quantile LSTM and an
+             N-BEATS model (via neuralforecast).
 
   Quantiles : Q10, Q25, Q50, Q75, Q90
-  Loss      : pinball (quantile regression) loss — one head per quantile
-  Input window : 60 days of noise residuals (or Optuna-optimised)
-  Forecast horizon : 15 days ahead
-  Models    : 12 total (6 sites x 2 variables)
+  Loss      : pinball (quantile regression) loss
+  Forecast horizon : 15 days ahead (FORECAST_HORIZON)
+  Combinations : 12 total (6 sites x 2 variables) x 2 candidate models
 
-Hyperparameter optimisation
-----------------------------
-  Optuna TPE sampler searches:
-    hidden_size  : [32, 64, 96, 128]
-    num_layers   : [1, 2, 3]
-    dropout      : [0.1, 0.5]
-    lr           : [1e-4, 1e-2]  log scale
-    batch_size   : [32, 64, 128]
-    input_window : [30, 45, 60, 90]
-  Objective : mean val pinball loss over all quantiles
-  Best params saved alongside model checkpoint.
+Baselines (also fitted, for comparison / diebold_mariano_test):
+  persistence (naive last-value), empirical (day-of-year quantile
+  lookup), ETS (Holt-Winters), STL+ETS (STL decomposition + ETS on
+  residuals).
+
+Hyperparameter optimisation (both models)
+------------------------------------------
+  LSTM  — Optuna TPE sampler searches hidden_size, num_layers, dropout,
+          lr, batch_size, input_window. Per-trial patience via
+          patience_per_trial; final fit via patience.
+  N-BEATS — Optuna TPE sampler searches input_size (multiple of
+          horizon), learning_rate, n_blocks, mlp_units_width.
+          early_stop_patience_steps is set EXPLICITLY (never omitted)
+          to -1 during tuning/CV and to `patience` during the final
+          fit, since neuralforecast's own default is version-dependent
+          and Lightning's EarlyStopping cannot reliably see
+          `ptl/val_loss` inside per-window cross_validation() refits.
+  Both : best params cached to model_dir as .npy, keyed by
+         site/variable, and reused unless force_retune=True.
+
+Explainability (both models, both SHAP and LIME)
+--------------------------------------------------
+  LSTM    : compute_shap() (GradientExplainer — note cuDNN is
+            temporarily disabled during this call, since cuDNN's LSTM
+            kernel cannot run backward() in eval mode), explain_forecast_lime().
+  N-BEATS : compute_shap_nbeats() (model-agnostic KernelExplainer via
+            a batched _predict_fn), explain_lime_nbeats().
+
+Model comparison & selection
+------------------------------
+  evaluate(method=...) : walk-forward pinball loss over the last
+    test_days. N-BEATS evaluation is batched into a single
+    cross_validation(use_fitted=True) call rather than one predict()
+    per day (test_days must be >= FORECAST_HORIZON).
+  select_best_model()  : picks the winner between candidates by
+    combined MAPE/RMSE/error-std rank, per the "smallest AND most
+    stable" resubmission criterion.
+  run_diebold_mariano() / diebold_mariano_test() : formal statistical
+    test of whether one method's forecast error is significantly
+    different from another's, not just numerically smaller.
+
+Persistence
+-----------
+  save_all_models(site) : exports parameters/artifacts for EVERY
+    fitted method at a site (not just the two ML models) into one
+    JSON manifest plus LSTM/N-BEATS binary checkpoints, so reported
+    paper results trace back to reproducible, saved artifacts rather
+    than only what happened to survive a Colab session.
 
 Python 3.9 compatible — uses Optional[X] not X | Y.
 """
@@ -717,6 +757,7 @@ class _QuantileLSTMModel:
         quantile_idx: int = 2,
         horizon_idx: int = 0,
         num_features: int = 10,
+        num_samples: int = 200,
     ) -> object:
         if not self._is_trained:
             raise RuntimeError("Call .fit() before explain_forecast_lime().")
@@ -753,6 +794,7 @@ class _QuantileLSTMModel:
             scaled_input,
             _predict_fn,
             num_features=num_features,
+            num_samples=num_samples,
         )
         logger.info("LIME top feature: %s", explanation.as_list()[0][0])
         return explanation
@@ -1215,7 +1257,8 @@ class _NBEATSModel:
         return importance
 
     def explain_lime(
-        self, residual_windows: np.ndarray, instance: np.ndarray, num_features: int = 10
+        self, residual_windows: np.ndarray, instance: np.ndarray,
+        num_features: int = 10, num_samples: int = 200,
     ):
         try:
             from lime import lime_tabular
@@ -1229,8 +1272,12 @@ class _NBEATSModel:
             mode="regression",
             feature_names=[f"lag_{i}" for i in range(residual_windows.shape[1])],
         )
+        # num_samples defaults to 5000 in LIME itself if not capped here —
+        # each sample is one call through _predict_fn (one batched
+        # NeuralForecast.predict() call), so this directly controls how
+        # long this explanation takes.
         explanation = explainer.explain_instance(
-            instance, self._predict_fn, num_features=num_features
+            instance, self._predict_fn, num_features=num_features, num_samples=num_samples
         )
         logger.info("N-BEATS LIME top feature: %s", explanation.as_list()[0][0])
         return explanation
@@ -1574,6 +1621,7 @@ class Forecaster:
         quantile_idx: int = 2,
         horizon_idx: int = 0,
         num_features: int = 10,
+        num_samples: int = 200,
     ) -> object:
         if site not in self._lstm_models:
             raise RuntimeError(f"Train LSTM for '{site}' first.")
@@ -1589,7 +1637,7 @@ class Forecaster:
             pad = np.zeros(iw - len(context))
             context = np.concatenate([pad, context])
         return self._lstm_models[site].explain_forecast_lime(
-            context, quantile_idx, horizon_idx, num_features
+            context, quantile_idx, horizon_idx, num_features, num_samples
         )
 
     # ------------------------------------------------------------------
@@ -1643,6 +1691,26 @@ class Forecaster:
         iw = self._nbeats_models[site].input_window
         windows = np.array([residuals[i : i + iw] for i in range(len(residuals) - iw)])
         return self._nbeats_models[site].compute_shap(windows, n_background, n_explain)
+
+    def explain_lime_nbeats(self, site: str, num_features: int = 10, num_samples: int = 200):
+        """
+        LIME explanation for N-BEATS, mirroring explain_forecast_lime()
+        (the LSTM equivalent). num_samples is capped well below LIME's
+        default of 5000 — at 5000 samples, each one triggers a call
+        through _predict_fn, and even batched, that default is far more
+        than needed for a stable local explanation and was the main
+        driver of slow SHAP/LIME cells earlier in this project.
+        """
+        residuals = self._decomposers[site].residuals.values
+        model = self._nbeats_models[site]
+        iw = model.input_window
+        windows = np.array([residuals[i : i + iw] for i in range(len(residuals) - iw)])
+        if len(windows) == 0:
+            raise RuntimeError(f"Not enough residual history to explain '{site}'.")
+        instance = windows[-1]
+        return model.explain_lime(
+            windows, instance, num_features=num_features, num_samples=num_samples
+        )
 
     def forecast_nbeats(
         self,
