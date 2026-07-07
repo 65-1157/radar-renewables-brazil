@@ -2036,6 +2036,70 @@ class Forecaster:
         self._nbeats_eval_cache[cache_key] = result
         return result
 
+    def _get_baseline_walkforward(
+        self, site: str, method: str, test_days: int = 90
+    ) -> pd.DataFrame:
+        """
+        Parallelized walk-forward for the ETS/STL+ETS baselines — same
+        expanding-window refit per anchor date as ETSForecaster.forecast()/
+        STLETSForecaster.forecast() (no methodology change), but dispatched
+        across CPU cores via ProcessPoolExecutor instead of run one day at
+        a time sequentially. This was the actual bottleneck behind CELL
+        12's long runtime, not N-BEATS or LSTM. Result cached per
+        site/method/test_days.
+        """
+        import concurrent.futures
+        import os as _os
+
+        if not hasattr(self, "_baseline_eval_cache"):
+            self._baseline_eval_cache: Dict[str, pd.DataFrame] = {}
+        cache_key = f"{method}_{site}_{test_days}"
+        if cache_key in self._baseline_eval_cache:
+            return self._baseline_eval_cache[cache_key]
+
+        series = self._get_site_series(site)
+        n = len(series)
+        cut_idx = n - test_days
+        anchor_dates = [series.index[cut_idx + step - 1] for step in range(test_days)]
+
+        series_values = series.values.tolist()
+        series_dates = [d.isoformat() for d in series.index]
+        dc = self._decomposers[site]
+
+        if method == "ets":
+            ets = self._ets_forecasters[site]
+            tasks = [
+                (series_values, series_dates, ets._method, ad.isoformat(), 1)
+                for ad in anchor_dates
+            ]
+            worker = _ets_walkforward_worker
+        elif method == "stl_ets":
+            tasks = []
+            for ad in anchor_dates:
+                future_date = ad + pd.Timedelta(days=1)
+                trend_fb = float(dc.trend_at(pd.DatetimeIndex([future_date]))[0])
+                seasonal_fb = float(dc.seasonal_at(pd.DatetimeIndex([future_date]))[0])
+                last_resid_fb = float(
+                    dc.residuals[dc.residuals.index <= ad].iloc[-1]
+                )
+                tasks.append((
+                    series_values, series_dates, ad.isoformat(), 1,
+                    trend_fb, seasonal_fb, last_resid_fb,
+                ))
+            worker = _stl_ets_walkforward_worker
+        else:
+            raise ValueError(f"Unsupported method for baseline walkforward: {method}")
+
+        n_workers = min(8, _os.cpu_count() or 4)
+        results = []
+        with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
+            for res in executor.map(worker, tasks):
+                results.extend(res)
+
+        df = pd.DataFrame(results, columns=["date", "value"]).set_index("date").sort_index()
+        self._baseline_eval_cache[cache_key] = df
+        return df
+
     def evaluate(
         self,
         site: str,
@@ -2064,6 +2128,13 @@ class Forecaster:
         if method == "nbeats" and site in self._nbeats_models:
             nbeats_wf = self._get_nbeats_walkforward(site, test_days=test_days)
 
+        # ETS / STL+ETS: same idea, but parallelized across cores since
+        # each anchor date still needs a genuine independent refit
+        # (unlike N-BEATS, there's no single cross_validation() shortcut).
+        baseline_wf = None
+        if method in ("ets", "stl_ets") and site in self._decomposers:
+            baseline_wf = self._get_baseline_walkforward(site, method, test_days=test_days)
+
         for step in range(test_days):
             anchor = series.index[cut_idx + step - 1]
             true_val = float(series.iloc[cut_idx + step])
@@ -2077,12 +2148,21 @@ class Forecaster:
                 else:
                     # fallback for any date the batched CV didn't cover
                     fan = self.forecast_nbeats(site, n_days=1, anchor_date=anchor)
+            elif method in ("ets", "stl_ets") and baseline_wf is not None:
+                target_date = series.index[cut_idx + step]
+                if target_date in baseline_wf.index:
+                    val = float(baseline_wf.loc[target_date, "value"])
+                    fan = pd.DataFrame(
+                        {lbl: [val] for lbl in QUANTILE_LABELS}, index=[target_date]
+                    )
+                else:
+                    fan = (
+                        self.forecast_ets(site, n_days=1, anchor_date=anchor)
+                        if method == "ets"
+                        else self.forecast_stl_ets(site, n_days=1, anchor_date=anchor)
+                    )
             elif method == "persistence":
                 fan = self.forecast_persistence(site, n_days=1, anchor_date=anchor)
-            elif method == "ets":
-                fan = self.forecast_ets(site, n_days=1, anchor_date=anchor)
-            elif method == "stl_ets":
-                fan = self.forecast_stl_ets(site, n_days=1, anchor_date=anchor)
             else:
                 fan = self.forecast_empirical(site, n_days=1, anchor_date=anchor)
 
@@ -2281,6 +2361,111 @@ class ForecastBundle:
         bundle["rho"] = [self._corr.get(site, dt.month) for dt in bundle.index]
         bundle.attrs.update({"site": site, "n_days": n_days})
         return bundle
+
+
+# ---------------------------------------------------------------------------
+# Parallel walk-forward workers for ETS / STL+ETS
+# ---------------------------------------------------------------------------
+# CELL 12's ~97-minute runtime was dominated by ETSForecaster.forecast()
+# and STLETSForecaster.forecast() refitting a fresh statsmodels model on
+# an EXPANDING window for every one of the ~90 test days, sequentially,
+# once per baseline, once per site/variable combo. These standalone
+# functions replicate that exact same per-day logic (same expanding
+# window, same model configuration — no methodology change) but are
+# structured as plain, picklable functions so they can be dispatched
+# across multiple CPU cores via ProcessPoolExecutor instead of run one
+# at a time in the main process.
+
+
+def _ets_walkforward_worker(args):
+    """One anchor date's ETS point forecast — mirrors ETSForecaster.forecast()."""
+    series_values, series_dates, method, anchor_date_str, n_days = args
+    import pandas as pd
+    import numpy as np
+    import warnings
+    from statsmodels.tsa.holtwinters import ExponentialSmoothing
+
+    series = pd.Series(series_values, index=pd.DatetimeIndex(series_dates))
+    anchor_date = pd.Timestamp(anchor_date_str)
+    series_to_anchor = series[series.index <= anchor_date]
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            if method == "holt_winters":
+                model = ExponentialSmoothing(
+                    series_to_anchor, trend="add", seasonal=None,
+                    initialization_method="estimated",
+                )
+            else:
+                model = ExponentialSmoothing(
+                    series_to_anchor, trend=None, seasonal=None,
+                    initialization_method="estimated",
+                )
+            fitted = model.fit(optimized=True)
+            point_forecasts = fitted.forecast(n_days).values
+    except Exception:
+        point_forecasts = np.full(n_days, float(series_to_anchor.iloc[-1]))
+
+    point_forecasts = np.clip(point_forecasts, 0, None)
+    future_dates = pd.date_range(start=anchor_date + pd.Timedelta(days=1), periods=n_days, freq="D")
+    return [(future_dates[i], float(point_forecasts[i])) for i in range(n_days)]
+
+
+def _stl_ets_walkforward_worker(args):
+    """One anchor date's STL+ETS point forecast — mirrors STLETSForecaster.forecast()."""
+    (series_values, series_dates, anchor_date_str, n_days,
+     trend_fallback, seasonal_fallback, last_resid_fallback) = args
+    import pandas as pd
+    import numpy as np
+    from statsmodels.tsa.stl._stl import STL
+    from statsmodels.tsa.holtwinters import ExponentialSmoothing
+
+    series = pd.Series(series_values, index=pd.DatetimeIndex(series_dates))
+    anchor_date = pd.Timestamp(anchor_date_str)
+    series_to_anchor = series[series.index <= anchor_date]
+    future_dates = pd.date_range(start=anchor_date + pd.Timedelta(days=1), periods=n_days, freq="D")
+
+    try:
+        period = min(365, len(series_to_anchor) // 2)
+        stl = STL(series_to_anchor, period=period, robust=True)
+        stl_fit = stl.fit()
+
+        trend = stl_fit.trend
+        seasonal = stl_fit.seasonal
+        residual = stl_fit.resid
+
+        tail = trend.tail(90)
+        x = np.arange(len(tail))
+        coeffs = np.polyfit(x, tail.values, 1)
+        future_trend = np.array(
+            [coeffs[0] * (len(tail) + i) + coeffs[1] for i in range(n_days)]
+        )
+        future_seasonal = np.array(
+            [float(seasonal.iloc[-(period - (i % period))]) for i in range(n_days)]
+        )
+
+        try:
+            ets_model = ExponentialSmoothing(
+                residual, trend=None, seasonal=None, initialization_method="estimated",
+            )
+            ets_fit = ets_model.fit(optimized=True)
+            future_resid = ets_fit.forecast(n_days).values
+        except Exception:
+            future_resid = np.zeros(n_days)
+
+        point_forecasts = np.clip(future_trend + future_seasonal + future_resid, 0, None)
+
+    except Exception:
+        # Same fallback as STLETSForecaster.forecast(), using values
+        # precomputed on the main process (trend_at/seasonal_at are cheap
+        # vectorized SignalDecomposer lookups, unlike the STL/ETS fit
+        # itself, so no need to pickle the whole decomposer into the worker).
+        point_forecasts = np.clip(
+            np.full(n_days, trend_fallback + seasonal_fallback + last_resid_fallback), 0, None,
+        )
+
+    return [(future_dates[i], float(point_forecasts[i])) for i in range(n_days)]
 
 
 # ---------------------------------------------------------------------------
