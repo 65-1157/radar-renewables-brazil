@@ -943,7 +943,7 @@ class _NBEATSModel:
         else:
             kwargs["early_stop_patience_steps"] = -1
         if callbacks:
-            kwargs["trainer_kwargs"] = callbacks
+            kwargs["callbacks"] = callbacks
         return NBEATS(**kwargs)
 
     def _to_nf_frame(self, residuals: np.ndarray, site: str) -> pd.DataFrame:
