@@ -928,10 +928,21 @@ class _NBEATSModel:
         patience=None,
         max_steps=None,
         callbacks=None,
+        quiet=True,
     ):
         from neuralforecast.models import NBEATS
         from neuralforecast.losses.pytorch import MQLoss
         import torch
+        import logging as _logging
+
+        if quiet:
+            # SHAP/LIME call predict() many times; each call otherwise
+            # prints its own "Predicting DataLoader..." progress bar and
+            # device-log block. Quieting these makes multi-call output
+            # (SHAP/LIME, Optuna trials) readable instead of a wall of
+            # near-identical repeated blocks.
+            _logging.getLogger("pytorch_lightning").setLevel(_logging.ERROR)
+            _logging.getLogger("lightning_fabric").setLevel(_logging.ERROR)
 
         kwargs = dict(
             h=self.horizon,
@@ -943,6 +954,16 @@ class _NBEATSModel:
             max_steps=max_steps or self.max_steps,
             scaler_type="standard",
             accelerator="gpu" if torch.cuda.is_available() else "cpu",
+            enable_progress_bar=not quiet,
+            # Each of the ~480 (12 sites/vars x 2 models x 20 trials) trial
+            # models otherwise writes its own Lightning checkpoint file and
+            # spins up a CSV/TensorBoard logger by default — pure overhead
+            # for anything that isn't the final saved model, and it eats
+            # disk (your screenshot shows 47GB already used) and time on a
+            # metered GPU budget with no active subscription.
+            enable_checkpointing=not quiet,
+            logger=not quiet,
+            enable_model_summary=not quiet,
         )
         # early_stop_patience_steps is set EXPLICITLY in both branches below
         # (never omitted) so behavior does not depend on whatever default
@@ -982,9 +1003,10 @@ class _NBEATSModel:
         """
         try:
             import optuna
+            import torch
             from neuralforecast import NeuralForecast
         except ImportError:
-            raise ImportError("Install with: pip install optuna neuralforecast")
+            raise ImportError("Install with: pip install optuna torch neuralforecast")
 
         optuna.logging.set_verbosity(
             optuna.logging.INFO if verbose else optuna.logging.WARNING
@@ -1015,6 +1037,17 @@ class _NBEATSModel:
             except Exception as exc:
                 logger.warning("N-BEATS trial failed: %s", exc)
                 raise optuna.exceptions.TrialPruned()
+            finally:
+                # A full run constructs ~480 short-lived trial models
+                # (12 sites/vars x 2 model types x 20 trials). Without
+                # explicitly releasing each one, CUDA memory can
+                # accumulate across trials and OOM partway through a
+                # long, metered-GPU run instead of failing fast here.
+                del model, nf
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             q_cols = [c for c in cv_df.columns if c not in ("unique_id", "ds", "cutoff", "y")]
             if not q_cols:
@@ -1076,6 +1109,7 @@ class _NBEATSModel:
                 p["mlp_units_width"],
                 patience=patience_val,
                 callbacks=[history],
+                quiet=not verbose,
             )
 
         nf_df = self._to_nf_frame(residuals, site)
@@ -1088,6 +1122,11 @@ class _NBEATSModel:
             logger.warning(
                 "N-BEATS fit with early stopping failed (%s); retrying without patience.", e
             )
+            import gc
+            import torch
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             history = _new_nbeats_loss_history()
             model = self._build_model(
                 p["input_size"],
@@ -1096,6 +1135,7 @@ class _NBEATSModel:
                 p["mlp_units_width"],
                 patience=None,
                 callbacks=[history],
+                quiet=not verbose,
             )
             self._nf = NeuralForecast(models=[model], freq="D")
             self._nf.fit(nf_df, val_size=self.horizon * 3)
@@ -1108,14 +1148,36 @@ class _NBEATSModel:
 
     # ------------------------------------------------------------------
     def _predict_fn(self, X: np.ndarray) -> np.ndarray:
-        """Model-agnostic wrapper for SHAP/LIME: X is (n_samples, input_window)."""
-        preds = []
-        for row in X:
-            df = self._to_nf_frame(row, self._site)
-            fcst = self._nf.predict(df=df)
-            q_cols = [c for c in fcst.columns if c not in ("unique_id", "ds")]
-            preds.append(float(fcst[q_cols[len(QUANTILES) // 2]].iloc[0]))
-        return np.array(preds)
+        """
+        Model-agnostic wrapper for SHAP/LIME: X is (n_samples, input_window).
+
+        Batches all rows into ONE NeuralForecast.predict() call (each row
+        given its own unique_id) instead of looping row-by-row. Looping
+        per row was correct but triggered a separate full Lightning
+        predict-loop (with its own progress bar/log block) per row —
+        with SHAP/LIME calling this dozens to hundreds of times, that
+        produced a wall of near-identical, hard-to-read output. Batching
+        cuts this to one predict-loop invocation per call to _predict_fn.
+        """
+        import time
+
+        t0 = time.time()
+        n = len(X)
+        row_ids = [f"row{i}" for i in range(n)]
+        frames = [self._to_nf_frame(X[i], row_ids[i]) for i in range(n)]
+        batch_df = pd.concat(frames, ignore_index=True)
+
+        fcst = self._nf.predict(df=batch_df)
+        q_cols = [c for c in fcst.columns if c not in ("unique_id", "ds")]
+        q50_col = q_cols[len(QUANTILES) // 2]
+
+        preds = np.zeros(n)
+        for i, rid in enumerate(row_ids):
+            row_fcst = fcst[fcst["unique_id"] == rid]
+            preds[i] = float(row_fcst[q50_col].iloc[0])
+
+        logger.info("_predict_fn: %d rows in one batched call (%.2fs)", n, time.time() - t0)
+        return preds
 
     def compute_shap(
         self, residual_windows: np.ndarray, n_background: int = 30, n_explain: int = 20
