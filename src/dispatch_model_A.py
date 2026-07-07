@@ -1,95 +1,117 @@
 """
-src/mopso_optimizer_A.py
-========================
-Multi-Objective Particle Swarm Optimization (MOPSO).
-Pre-computes LSTM arrays to allow Numba parallelization.
+src/dispatch_model_A.py
+=======================
+Ultra-fast, Numba-compiled operational simulation loop.
+Implements the predictive dispatch (Strategy 3) and battery degradation logic.
 """
 
 import numpy as np
 import pandas as pd
-from pymoo.core.problem import ElementwiseProblem
-from pymoo.algorithms.moo.mopso import MOPSO
-from pymoo.optimize import minimize
-from pymoo.termination import get_termination
-from src.dispatch_model_A import evaluate_predictive_dispatch
+from numba import njit
+from typing import Tuple
 
-class MicrogridSizingProblem(ElementwiseProblem):
-    def __init__(
-        self, pv_arr, wind_arr, demand_arr, 
-        lookahead_gen_arr, lookahead_dem_arr, params
-    ):
-        super().__init__(n_var=3, n_obj=2, 
-                         xl=np.array([10.0, 0.0, 50.0]),     
-                         xu=np.array([1000.0, 10.0, 2000.0])) 
-        
-        self.pv_arr = pv_arr
-        self.wind_arr = wind_arr
-        self.demand_arr = demand_arr
-        self.lookahead_gen_arr = lookahead_gen_arr
-        self.lookahead_dem_arr = lookahead_dem_arr
-        self.params = params
-
-    def _evaluate(self, x, out, *args, **kwargs):
-        area_m2, n_turbines, battery_kwh = x[0], np.round(x[1]), x[2]
-        
-        lcoe, diesel = evaluate_predictive_dispatch(
-            area_m2, n_turbines, battery_kwh,
-            self.pv_arr, self.wind_arr, self.demand_arr,
-            self.lookahead_gen_arr, self.lookahead_dem_arr,
-            self.params
-        )
-        out["F"] = [lcoe, diesel]
-
-def precompute_lstm_lookahead(forecast_bundle, demand_series, site):
+@njit
+def _fast_numba_dispatch(
+    area_m2,
+    n_turbines,
+    battery_kwh_max,
+    pv_arr,
+    wind_arr,
+    demand_arr,
+    lookahead_gen_arr,
+    lookahead_dem_arr,
+    diesel_eff,
+    diesel_lhv
+):
     """
-    Runs the LSTM once to generate static 3-day sum arrays. 
-    This enables the Numba compiler in Layer 1 to operate without Python objects.
+    Core simulation loop compiled to C-level machine code via Numba.
+    Contains zero Python objects (no Pandas, no classes) for maximum speed.
     """
-    n_days = len(demand_series)
-    dates = demand_series.index
+    # Explicitly define states as floats to prevent Numba casting issues
+    battery_current = float(battery_kwh_max)
+    total_diesel_litres = 0.0
+    battery_cycles = 0.0
     
-    lookahead_gen = np.zeros(n_days)
-    lookahead_dem = np.zeros(n_days)
+    n_days = len(demand_arr) - 3
     
-    print(f"Pre-computing LSTM lookahead arrays for {site}...")
-    for i in range(n_days - 3):
-        lookahead = forecast_bundle.forecast(site=site, n_days=3, anchor_date=dates[i])
-        lookahead_gen[i] = lookahead['solar_Q10'].sum() + lookahead['wind_Q10'].sum()
-        lookahead_dem[i] = demand_series.iloc[i+1 : i+4].sum()
+    for i in range(n_days):
+        net_energy = (pv_arr[i] * area_m2) + (wind_arr[i] * n_turbines) - demand_arr[i]
         
-    return lookahead_gen, lookahead_dem
+        # Predictive Check 
+        upcoming_generation = lookahead_gen_arr[i]
+        upcoming_demand = lookahead_dem_arr[i]
+        emergency_incoming = upcoming_generation < (upcoming_demand * 0.5)
+        
+        # Dispatch Logic
+        if emergency_incoming and battery_current < (0.5 * battery_kwh_max):
+            deficit = battery_kwh_max - battery_current
+            total_diesel_litres += (deficit / (diesel_eff * diesel_lhv))
+            battery_current = float(battery_kwh_max)
+        elif net_energy > 0.0:
+            if battery_current + net_energy > battery_kwh_max:
+                battery_current = float(battery_kwh_max)
+            else:
+                battery_current += net_energy
+        else:
+            discharge_amount = abs(net_energy)
+            if battery_current >= discharge_amount:
+                battery_current -= discharge_amount
+                battery_cycles += (discharge_amount / battery_kwh_max)
+            else:
+                shortfall = discharge_amount - battery_current
+                battery_current = 0.0
+                total_diesel_litres += (shortfall / (diesel_eff * diesel_lhv))
+                battery_cycles += 1.0 
+                
+    return total_diesel_litres, battery_cycles
 
-def run_swarm_optimization(
-    actual_solar, actual_wind, demand, forecast_bundle, site, params
-) -> pd.DataFrame:
-    
-    # 1. Prepare raw arrays for Numba
-    pv_arr = (actual_solar * params["solar"]["efficiency"] * params["solar"]["performance_ratio"]).values
-    wind_arr = (actual_wind * params["wind"]["rated_power_kw"]).values
-    demand_arr = demand.values
-    
-    # 2. Pre-compute Neural Network lookaheads
-    lookahead_gen_arr, lookahead_dem_arr = precompute_lstm_lookahead(forecast_bundle, demand, site)
-    
-    # 3. Initialize Swarm
-    problem = MicrogridSizingProblem(
-        pv_arr, wind_arr, demand_arr, lookahead_gen_arr, lookahead_dem_arr, params
+def evaluate_predictive_dispatch(
+    area_m2: float,
+    n_turbines: float,
+    battery_kwh_max: float,
+    pv_arr: np.ndarray,
+    wind_arr: np.ndarray,
+    demand_arr: np.ndarray,
+    lookahead_gen_arr: np.ndarray,
+    lookahead_dem_arr: np.ndarray,
+    params: dict
+) -> Tuple[float, float]:
+    """
+    Python wrapper that extracts parameters from dictionaries and calls the 
+    Numba-compiled engine. Returns LCOE and Total Diesel Litres.
+    """
+    # Execute compiled C-code loop
+    # We cast decision variables to float to prevent Numba signature mismatch
+    total_diesel_litres, battery_cycles = _fast_numba_dispatch(
+        float(area_m2), 
+        float(n_turbines), 
+        float(battery_kwh_max),
+        pv_arr, 
+        wind_arr, 
+        demand_arr,
+        lookahead_gen_arr, 
+        lookahead_dem_arr,
+        float(params["diesel"]["efficiency"]), 
+        float(params["diesel"]["lhv_kwh_per_litre"])
     )
     
-    algorithm = MOPSO(pop_size=50)
-    termination = get_termination("n_gen", 40) 
+    # Financial Degradation Penalty Calculation
+    lifespan_cycles = 3000.0
+    replacements_needed = np.floor((battery_cycles * 20.0) / lifespan_cycles)
     
-    print(f"Executing MOPSO Optimization for {site}...")
-    res = minimize(problem, algorithm, termination, seed=42, verbose=True)
+    capex = (area_m2 * params["economics"]["cost_pv_m2"]) + \
+            (n_turbines * params["economics"]["cost_wind_turbine"]) + \
+            (battery_kwh_max * params["economics"]["cost_battery_kwh"])
+            
+    replacement_cost = replacements_needed * (battery_kwh_max * params["economics"]["cost_battery_kwh"])
+    crf = (0.08 * (1.0 + 0.08)**20) / ((1.0 + 0.08)**20 - 1.0)
     
-    results_df = pd.DataFrame({
-        "Area_m2": np.round(res.X[:, 0], 2),
-        "n_Turbines": np.round(res.X[:, 1], 0),
-        "Battery_kWh": np.round(res.X[:, 2], 2),
-        "LCOE_USD": np.round(res.F[:, 0], 4),
-        "Diesel_Litres": np.round(res.F[:, 1], 2)
-    })
+    annual_diesel_cost = total_diesel_litres * params["diesel"]["price_usd_per_litre"]
+    annualized_cost = (capex + replacement_cost) * crf + annual_diesel_cost
     
-    output_path = f"outputs/pareto_front_{site}_A.csv"
-    results_df.to_csv(output_path, index=False)
-    return results_df
+    # Calculate LCOE over the 20-year demand
+    total_lifetime_demand = np.sum(demand_arr) * 20.0
+    total_lifetime_cost = annualized_cost * 20.0
+    lcoe = total_lifetime_cost / total_lifetime_demand if total_lifetime_demand > 0.0 else 9999.0
+    
+    return lcoe, total_diesel_litres
