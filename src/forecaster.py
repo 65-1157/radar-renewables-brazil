@@ -675,8 +675,21 @@ class _QuantileLSTMModel:
         flat_net = _FlatNet(self._net).to(self._device)
         flat_net.eval()
 
-        explainer = shap.GradientExplainer(flat_net, background)
-        shap_vals = explainer.shap_values(X_exp)
+        # cuDNN's optimized LSTM kernel refuses to run backward() while the
+        # module is in eval mode (it discards the buffers backward needs, as
+        # an inference-only speed optimization). shap.GradientExplainer calls
+        # backward() internally, so disable cuDNN for just this call — this
+        # falls back to PyTorch's native LSTM path, which supports backward
+        # in eval mode. Dropout/eval behavior is unaffected; only the CUDA
+        # kernel used changes.
+        cudnn_was_enabled = torch.backends.cudnn.enabled
+        torch.backends.cudnn.enabled = False
+        try:
+            explainer = shap.GradientExplainer(flat_net, background)
+            shap_vals = explainer.shap_values(X_exp)
+        finally:
+            torch.backends.cudnn.enabled = cudnn_was_enabled
+
         stacked = np.stack([sv[:, :, 0] for sv in shap_vals], axis=-1)
         self.shap_values = stacked
         shap_mean_abs = np.mean(np.abs(stacked), axis=(0, 2))
@@ -2145,4 +2158,3 @@ def select_best_model(compare_df: pd.DataFrame, candidates=("lstm", "nbeats")) -
     sub["rank_score"] = sub["rmse"].rank() + sub["mape"].rank() + sub["error_std"].rank()
     winner = sub.sort_values("rank_score").iloc[0]["method"]
     return winner
-
