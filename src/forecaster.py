@@ -1328,6 +1328,133 @@ class Forecaster:
         self._empirical_fitted = True
         return self
 
+    def save_all_models(self, site: str) -> Dict[str, str]:
+        """
+        Persist parameters/artifacts for EVERY fitted method at this site
+        — not just LSTM/N-BEATS. Writes:
+          - one consolidated JSON manifest of hyperparameters/config per
+            method (persistence, empirical, ets, stl_ets, lstm, nbeats)
+          - separate binary artifact files for LSTM (.pt, via its existing
+            save()) and N-BEATS (via NeuralForecast's own .save())
+
+        Returns a dict of {method: status_message} so failures for one
+        method (e.g. N-BEATS not yet trained) don't block saving the rest.
+        """
+        import json
+        import numpy as _np
+
+        def _jsonable(obj):
+            """Best-effort conversion of numpy/statsmodels values to plain JSON types."""
+            if isinstance(obj, dict):
+                return {str(k): _jsonable(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [_jsonable(v) for v in obj]
+            if isinstance(obj, (_np.integer,)):
+                return int(obj)
+            if isinstance(obj, (_np.floating,)):
+                return float(obj)
+            if isinstance(obj, _np.ndarray):
+                return _jsonable(obj.tolist())
+            if isinstance(obj, (int, float, str, bool)) or obj is None:
+                return obj
+            return str(obj)  # last resort, keeps the manifest from failing to write
+
+        manifest: Dict[str, dict] = {}
+        status: Dict[str, str] = {}
+        site_tag = site.replace(" ", "_")
+
+        # --- persistence: stateless, no fitted parameters to save ---
+        manifest["persistence"] = {
+            "method": "persistence",
+            "parameters": "none (naive last-observed-value baseline)",
+        }
+        status["persistence"] = "documented (no parameters)"
+
+        # --- empirical: full day-of-year quantile lookup table ---
+        try:
+            emp = self._emp_forecasters[site]
+            manifest["empirical"] = {
+                "method": "empirical",
+                "doy_quantiles": _jsonable(emp._doy_quantiles),
+            }
+            status["empirical"] = "saved"
+        except Exception as e:
+            status["empirical"] = f"FAILED: {e}"
+
+        # --- ETS: representative smoothing parameters from the initial fit ---
+        try:
+            ets = self._ets_forecasters[site]
+            params = dict(ets._model.params) if ets._model is not None else {}
+            manifest["ets"] = {
+                "method": ets._method,
+                "parameters": _jsonable(params),
+                "note": (
+                    "Representative parameters from the initial fit() call. "
+                    "forecast() itself refits per anchor date on an expanding "
+                    "window, so per-anchor parameters vary slightly from this."
+                ),
+            }
+            status["ets"] = "saved"
+        except Exception as e:
+            status["ets"] = f"FAILED: {e}"
+
+        # --- STL+ETS: no persistent fitted object (recomputed per forecast
+        # call) — document configuration instead of fabricating parameters ---
+        manifest["stl_ets"] = {
+            "method": "stl_ets",
+            "note": (
+                "STL decomposition and ETS-on-residuals are both recomputed "
+                "fresh inside every forecast() call (expanding window), so "
+                "there is no single fitted parameter set to export. "
+                "Configuration: STL(period=min(365, len(history)//2), "
+                "robust=True); ExponentialSmoothing(trend='add') on residuals."
+            ),
+        }
+        status["stl_ets"] = "documented (no persistent parameters)"
+
+        # --- LSTM: full checkpoint (weights + hyperparameters) ---
+        try:
+            if site in self._lstm_models and self._lstm_models[site]._is_trained:
+                lstm_path = self._model_dir / f"lstm_{self.variable}_{site_tag}.pt"
+                self._lstm_models[site].save(lstm_path)
+                manifest["lstm"] = {
+                    "method": "lstm",
+                    "best_params": _jsonable(self._lstm_models[site].best_params),
+                    "checkpoint_path": str(lstm_path),
+                }
+                status["lstm"] = f"saved -> {lstm_path}"
+            else:
+                status["lstm"] = "skipped (not trained for this site)"
+        except Exception as e:
+            status["lstm"] = f"FAILED: {e}"
+
+        # --- N-BEATS: NeuralForecast's own save + hyperparameters ---
+        try:
+            if site in self._nbeats_models and self._nbeats_models[site]._is_trained:
+                nbeats_dir = self._model_dir / f"nbeats_{self.variable}_{site_tag}"
+                self._nbeats_models[site]._nf.save(
+                    path=str(nbeats_dir), overwrite=True, save_dataset=False
+                )
+                manifest["nbeats"] = {
+                    "method": "nbeats",
+                    "best_params": _jsonable(self._nbeats_models[site].best_params),
+                    "checkpoint_dir": str(nbeats_dir),
+                }
+                status["nbeats"] = f"saved -> {nbeats_dir}"
+            else:
+                status["nbeats"] = "skipped (not trained for this site)"
+        except Exception as e:
+            status["nbeats"] = f"FAILED: {e}"
+
+        manifest_path = self._model_dir / f"parameters_{self.variable}_{site_tag}.json"
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2)
+        status["manifest"] = f"saved -> {manifest_path}"
+
+        for method, msg in status.items():
+            logger.info("save_all_models[%s/%s] %s: %s", self.variable, site, method, msg)
+        return status
+
     def tune_lstm(
         self,
         site: str,
