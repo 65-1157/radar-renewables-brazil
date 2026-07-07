@@ -1723,6 +1723,9 @@ class Forecaster:
 
         cv_df = model._nf.cross_validation(
             full_df,
+            n_windows=None,  # required: n_windows defaults to 1 (not None) in
+                              # neuralforecast, so passing test_size without
+                              # explicitly nulling n_windows conflicts with it.
             test_size=test_days,
             step_size=1,
             use_fitted=True,
