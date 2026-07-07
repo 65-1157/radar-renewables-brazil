@@ -1712,6 +1712,15 @@ class Forecaster:
         """
         if not hasattr(self, "_nbeats_eval_cache"):
             self._nbeats_eval_cache: Dict[str, pd.DataFrame] = {}
+
+        if test_days < FORECAST_HORIZON:
+            raise ValueError(
+                f"test_days ({test_days}) must be >= the model's forecast "
+                f"horizon ({FORECAST_HORIZON}) — neuralforecast's "
+                f"cross_validation() requires test_size >= h. Use "
+                f"test_days={FORECAST_HORIZON} or higher."
+            )
+
         cache_key = f"{site}_{test_days}"
         if cache_key in self._nbeats_eval_cache:
             return self._nbeats_eval_cache[cache_key]
