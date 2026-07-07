@@ -1332,6 +1332,7 @@ class Forecaster:
         self._stlets_forecasters: Dict[str, STLETSForecaster] = {}
         self._lstm_models: Dict[str, _QuantileLSTMModel] = {}
         self._nbeats_models: Dict[str, "_NBEATSModel"] = {}
+        self._winners: Dict[str, str] = {}  # site -> "lstm" | "nbeats", set via set_winner()/load_winners()
 
         self._empirical_fitted: bool = False
         self._lstm_fitted_sites: List[str] = []
@@ -1879,13 +1880,69 @@ class Forecaster:
         fan.attrs.update({"site": site, "variable": self.variable, "method": "lstm"})
         return fan
 
+    def get_residuals(self, site: str) -> pd.Series:
+        """Public accessor for a site's decomposition residuals — needed
+        e.g. by SiteCorrelationEstimator.fit() without reaching into the
+        internal _decomposers dict from other modules."""
+        if site not in self._decomposers:
+            raise RuntimeError(f"fit_empirical() has not been run for '{site}'.")
+        return self._decomposers[site].residuals
+
+    def set_winner(self, site: str, method: str) -> None:
+        """Record which method (e.g. 'lstm' or 'nbeats') won for this site,
+        so forecast() — the method ForecastBundle/PSTEF actually calls —
+        uses the SELECTED model, not an LSTM-always default."""
+        self._winners[site] = method
+
+    def load_winners(self, winners_path: Path) -> Dict[str, str]:
+        """
+        Load winners.json (as produced by CELL 12's select_best_model loop)
+        and register them via set_winner(). Keys in winners.json are
+        "{variable}_{site}" (covering both solar and wind); only entries
+        matching THIS Forecaster's own variable are applied, matched by
+        stripping the "{self.variable}_" prefix.
+        """
+        import json
+        with open(winners_path) as f:
+            raw = json.load(f)
+        applied = {}
+        prefix = f"{self.variable}_"
+        for key, method in raw.items():
+            if key.startswith(prefix):
+                site = key[len(prefix):]
+                self.set_winner(site, method)
+                applied[site] = method
+        logger.info(
+            "load_winners: applied %d winner(s) for variable=%s: %s",
+            len(applied), self.variable, applied,
+        )
+        return applied
+
     def forecast(
         self,
         site: str,
         n_days: int = FORECAST_HORIZON,
         anchor_date: Optional[pd.Timestamp] = None,
     ) -> pd.DataFrame:
-        """Auto-select: LSTM if trained, else empirical."""
+        """
+        Dispatch to whichever method actually won for this site, per
+        select_best_model() (see set_winner()/load_winners()). This is
+        the method the downstream PSTEF/MOPSO/dispatch pipeline actually
+        calls via ForecastBundle — if no winner has been recorded (e.g.
+        CELL 12 hasn't run yet, or this site wasn't included), it falls
+        back to LSTM-if-trained, then empirical, same as the prior
+        default behavior.
+        """
+        winner = self._winners.get(site)
+        if winner == "nbeats" and site in self._nbeats_models and self._nbeats_models[site]._is_trained:
+            return self.forecast_nbeats(site, n_days=n_days, anchor_date=anchor_date)
+        if winner == "lstm" and site in self._lstm_models and self._lstm_models[site]._is_trained:
+            return self.forecast_lstm(site, n_days=n_days, anchor_date=anchor_date)
+        if winner is not None:
+            logger.warning(
+                "forecast(%s): recorded winner '%s' is not trained/available — "
+                "falling back to LSTM-if-trained, else empirical.", site, winner,
+            )
         if site in self._lstm_models and self._lstm_models[site]._is_trained:
             return self.forecast_lstm(site, n_days=n_days, anchor_date=anchor_date)
         return self.forecast_empirical(site, n_days=n_days, anchor_date=anchor_date)
@@ -2085,10 +2142,18 @@ class Forecaster:
         reference_method: str = "lstm",
         quantile: float = 0.50,
         test_days: int = 90,
+        precomputed_eval: Optional[Dict[str, pd.DataFrame]] = None,
     ) -> pd.DataFrame:
         """
         Run DM test comparing reference_method vs all other methods.
         Returns DataFrame with dm_statistic, p_value, significant columns.
+
+        precomputed_eval: optionally pass in {method: evaluate()-result}
+        for methods already evaluated elsewhere (e.g. CELL 12 already
+        evaluates "lstm"/"nbeats" before calling this) to avoid
+        redundantly re-running evaluate() — which for ETS/STL+ETS in
+        particular refits a fresh statsmodels model per test day and is
+        the most likely reason this step was slow.
         """
         methods = ["persistence", "ets", "stl_ets", "empirical"]
         if site in self._lstm_models and self._lstm_models[site]._is_trained:
@@ -2096,8 +2161,12 @@ class Forecaster:
         if site in self._nbeats_models and self._nbeats_models[site]._is_trained:
             methods.append("nbeats")
 
+        precomputed_eval = precomputed_eval or {}
         eval_results = {}
         for method in methods:
+            if method in precomputed_eval:
+                eval_results[method] = precomputed_eval[method]
+                continue
             try:
                 eval_results[method] = self.evaluate(site, method=method, test_days=test_days)
             except Exception as e:
@@ -2111,6 +2180,23 @@ class Forecaster:
             reference_method=reference_method,
             quantile=quantile,
         )
+
+        # FIX: run_diebold_mariano() returns a columnless empty DataFrame
+        # if zero comparisons had >=10 overlapping dates — inserting a
+        # column at a fixed position (e.g. index 2) then crashes with
+        # IndexError, since that position doesn't exist yet. Build the
+        # frame safely instead of assuming a minimum column count.
+        if dm_table.empty:
+            logger.warning(
+                "run_diebold_mariano(%s): no method comparisons had >=10 "
+                "overlapping evaluation dates — returning an empty result "
+                "for this site instead of crashing.", site,
+            )
+            return pd.DataFrame(
+                columns=["site", "method_a", "method_b", "quantile",
+                         "dm_statistic", "p_value", "significant", "winner"]
+            )
+
         dm_table.insert(0, "site", site)
         return dm_table
 
