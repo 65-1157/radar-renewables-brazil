@@ -1,3 +1,5 @@
+# diesel.py -- updated 07JUL26
+
 import pandas as pd
 import numpy as np
 import yaml
@@ -70,9 +72,34 @@ def run_diesel_model(
     site_df = run_solar_model(site_df, params, area_m2=area_m2)
     site_df = run_wind_model(site_df, params, n_turbines=n_turbines)
 
-    demand = demand_df["demand_kwh"].values
-    pv = site_df["pv_output_kwh"].values[:len(demand)]
-    wind = site_df["wind_output_kwh"].values[:len(demand)]
+    # FIX: demand_df (built from config date_start/date_end) and site_df
+    # (real NASA data, may end earlier — confirmed config date_end
+    # 2026-06-01 vs actual data through ~2026-03-31) can have DIFFERENT
+    # lengths. The original code sliced pv/wind to len(demand) but left
+    # demand itself un-truncated to the SHORTER of the two — if site_df
+    # was shorter, pv/wind arrays came out shorter than demand, and the
+    # subsequent Series arithmetic (different-length RangeIndex Series)
+    # silently produced NaN for the non-overlapping tail, which
+    # residual_kwh.sum() then silently drops (skipna=True by default).
+    # Net effect: the last ~2 months of demand quietly vanished from
+    # every diesel-litres/cost/CO2 number in diesel_scenario_table(),
+    # with no error or warning. Now explicitly aligned to the shortest
+    # of the three before any arithmetic — same pattern already used
+    # correctly in compute_diesel_metrics_quantiles() below.
+    n = min(len(demand_df), len(site_df))
+    if len(demand_df) != len(site_df):
+        import logging
+        logging.getLogger(__name__).warning(
+            "run_diesel_model: demand_df (%d rows) and site_df (%d rows) "
+            "have different lengths — truncating both to %d rows. This "
+            "usually means config date_start/date_end doesn't match the "
+            "real data's actual date range.",
+            len(demand_df), len(site_df), n,
+        )
+
+    demand = demand_df["demand_kwh"].values[:n]
+    pv = site_df["pv_output_kwh"].values[:n]
+    wind = site_df["wind_output_kwh"].values[:n]
 
     demand_s = pd.Series(demand)
     pv_s = pd.Series(pv)
@@ -199,7 +226,8 @@ def compute_diesel_metrics_quantiles(
       co2_saved_tonnes_Q10, _Q50, _Q90
       renewable_pct_Q10, _Q50, _Q90
     """
-    # Align lengths
+    # Align lengths — this pattern was already correct here; run_diesel_model()
+    # above now follows the same approach.
     n = min(len(demand_kwh), len(pv_fan), len(wind_fan))
     demand_s = pd.Series(demand_kwh.values[:n])
 
@@ -259,7 +287,7 @@ def diesel_quantile_scenario_table(
 ) -> pd.DataFrame:
     """
     Full combinatorial sweep producing Q10/Q50/Q90 diesel metrics
-    for every site × solar area × n_turbines combination.
+    for every site x solar area x n_turbines combination.
 
     Parameters
     ----------
@@ -281,8 +309,6 @@ def diesel_quantile_scenario_table(
     for loc, df in all_data.items():
         stype = site_types.get(loc, "coastal")
 
-        # Build full historical quantile series using day-of-year
-        # empirical quantiles — one value per day in the record
         sol_dc = solar_forecasters[loc]._decomposers[loc]
         wnd_dc = wind_forecasters[loc]._decomposers[loc]
         sol_emp = solar_forecasters[loc]._emp_forecasters[loc]
@@ -315,7 +341,6 @@ def diesel_quantile_scenario_table(
                 index=dates,
             )
 
-        # Average by day-of-year to get one representative year (365 days)
         sol_fan_hist = pd.DataFrame(sol_q)
         wnd_fan_hist = pd.DataFrame(wnd_q)
         sol_annual = sol_fan_hist.groupby(
@@ -325,12 +350,10 @@ def diesel_quantile_scenario_table(
             wnd_fan_hist.index.dayofyear
         ).mean().iloc[:365]
 
-        # One representative year of demand
         demand_annual = pd.Series(
             demand_df["demand_kwh"].values[:365]
         )
 
-        # Correlation at mid-year (June)
         rho = correlation_estimator.get(loc, 6)
 
         for area in params["solar"]["scenarios_area_m2"]:
