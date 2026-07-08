@@ -134,27 +134,20 @@ def run_monte_carlo(
     annual_demand_kwh: float,
     diesel_price: float,
     iterations: int = 10000,
-) -> float:
+    return_raw: bool = False,
+):
     """
     Injects 10,000 randomized 20-year scenarios into the chosen blueprint
     to verify the probability of surviving severe financial AND
     meteorological deviations — perturbing solar yield, wind yield, AND
     diesel price.
 
-    FIX: the previous formula added (adjusted_diesel_litres * price) /
-    100000.0 directly to base_lcoe — base_diesel came from
-    optimal_blueprint['Diesel_Litres'], a MULTI-YEAR total (per
-    dispatch_model_A.py's preserved return semantics), combined with an
-    arbitrary 100000.0 divisor with no dimensional connection to
-    base_lcoe (USD/kWh). Verified this failed the budget cap on EVERY
-    iteration even at baseline (zero adverse perturbation) — a formula
-    artifact, not a genuine risk finding. Now: the blueprint's OWN
-    annual diesel cost is derived here (from its Diesel_Litres,
-    correctly divided by years_simulated), and the simulated LCOE shift
-    is expressed in the same USD/kWh units as base_lcoe:
-    delta_annual_cost / annual_demand_kwh. diesel_price is passed in
-    already resolved for site_type (remote_island vs coastal) by the
-    caller, so this function doesn't need to know about site types.
+    return_raw: if True, ALSO returns the raw array of 10,000 simulated
+    LCOE values (for plot_monte_carlo_risk()'s histogram). Default False
+    preserves the exact prior return type (float only) for every
+    existing call site — this was added for a small, targeted set of
+    paper figures (2 representative sites) rather than changing
+    execute_decision_engine()'s or main_pstef_A.py's behavior.
     """
     print(f"Running Monte Carlo Risk Assessment ({iterations} iterations)...")
 
@@ -169,15 +162,12 @@ def run_monte_carlo(
 
     success_count = 0
     budget_cap = base_lcoe * 1.20
+    sim_lcoe_array = np.zeros(iterations) if return_raw else None
 
     for i in range(iterations):
         price_i = max(0.5, sim_diesel_prices[i])
         price_ratio = price_i / diesel_price
 
-        # Combined renewable yield multiplier: equal-weighted average of
-        # solar and wind performance deviations — documented simplification,
-        # since this layer doesn't receive the underlying PV/wind
-        # generation split, only the blueprint's aggregate figures.
         combined_yield_multiplier = 0.5 * sim_solar_yields[i] + 0.5 * sim_wind_yields[i]
 
         adjusted_annual_diesel_cost = (
@@ -185,13 +175,16 @@ def run_monte_carlo(
         )
         delta_annual_cost = adjusted_annual_diesel_cost - base_annual_diesel_cost
 
-        # USD/yr divided by kWh/yr = USD/kWh — same units as base_lcoe.
         sim_lcoe = base_lcoe + (delta_annual_cost / annual_demand_kwh)
 
+        if return_raw:
+            sim_lcoe_array[i] = sim_lcoe
         if sim_lcoe <= budget_cap:
             success_count += 1
 
     probability_success = (success_count / iterations) * 100.0
+    if return_raw:
+        return probability_success, sim_lcoe_array
     return probability_success
 
 
