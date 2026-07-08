@@ -56,16 +56,13 @@ diesel:
 
 # ── Economics (both PSTEF/MOPSO inline calc AND legacy economics.py) ──────
 economics:
-  # Used by dispatch_model_A.py's inline LCOE calc (PSTEF/MOPSO path)
   cost_pv_m2: 250.0
-  cost_wind_turbine: 100000.0
+  cost_wind_turbine: 30000.0          # was 100000.0 — now matches $3,000/kW × 10kW rated turbine
   cost_battery_kwh: 400.0
-  # Used by economics.py's capex_usd()/lcoe_usd_per_kwh() (legacy path)
   solar_capex_usd_per_kw: 1000.0
-  wind_capex_usd_per_kw: 2000.0
+  wind_capex_usd_per_kw: 3000.0       # was 2000.0 — now matches the same $3,000/kW
   battery_capex_usd_per_kwh: 400.0
   opex_pct_capex: 0.02
-  # Shared by both
   discount_rate: 0.08
   project_life_years: 20
 
