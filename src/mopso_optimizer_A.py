@@ -70,23 +70,45 @@ def precompute_lstm_lookahead(forecast_bundle, demand_series, site):
     If the winning model for this site is N-BEATS, each call is a real
     NeuralForecast.predict() with non-trivial overhead — the same
     per-call cost that was batched away in forecaster.py's
-    _get_nbeats_walkforward() for evaluation. This function does NOT yet
-    have that optimization; for an N-BEATS-winning site this could be
-    slow. Flagging rather than silently leaving it, since batching this
-    the same way is a reasonable follow-up if it proves too slow in
-    practice.
+    _get_nbeats_walkforward() for evaluation. Not batched here yet;
+    flagged as a reasonable follow-up if it proves too slow in practice.
+
+    MEMORY: periodic gc.collect()/torch.cuda.empty_cache() added every
+    200 iterations — the same class of fix applied earlier to the
+    Optuna tuning loops (tune_lstm/tune_nbeats), which this loop had
+    been missing despite calling the same underlying forecast methods
+    thousands of times across a full CELL 16 run (7 sites x ~2000+ days).
     """
+    import time
+    import gc
+    import torch
+
     n_days = len(demand_series)
     dates = demand_series.index
 
     lookahead_gen = np.zeros(n_days)
     lookahead_dem = np.zeros(n_days)
 
-    print(f"Pre-computing forecast lookahead arrays for {site}...")
+    print(f"Pre-computing forecast lookahead arrays for {site} ({n_days - 3} days)...")
+    t0 = time.time()
+    CLEANUP_EVERY = 200
+    PROGRESS_EVERY = 500
+
     for i in range(n_days - 3):
         lookahead = forecast_bundle.forecast(site=site, n_days=3, anchor_date=dates[i])
         lookahead_gen[i] = lookahead['solar_Q10'].sum() + lookahead['wind_Q10'].sum()
         lookahead_dem[i] = demand_series.iloc[i+1 : i+4].sum()
+
+        if (i + 1) % CLEANUP_EVERY == 0:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        if (i + 1) % PROGRESS_EVERY == 0:
+            elapsed = time.time() - t0
+            eta = (elapsed / (i + 1)) * (n_days - 3 - (i + 1))
+            print(f"  lookahead precompute [{i+1}/{n_days-3}] "
+                  f"elapsed {elapsed:.0f}s, ETA ~{eta:.0f}s")
 
     return lookahead_gen, lookahead_dem
 
