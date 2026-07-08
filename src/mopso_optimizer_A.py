@@ -37,9 +37,23 @@ class MicrogridSizingProblem(ElementwiseProblem):
         lookahead_gen_arr, lookahead_dem_arr, params,
         site_type: str = "coastal",
     ):
+        # Area_m2 upper bound widened 1000.0 -> 3000.0: verified on the
+        # Salvador Pareto front that EVERY top candidate (by both LCOE
+        # and diesel litres) was pinned exactly to the old 1000.0 bound,
+        # with no exceptions — a specific signal the true unconstrained
+        # optimum lies above it, not that 1000 m2 was itself optimal.
+        # n_Turbines and Battery_kWh are left unchanged: both already
+        # showed genuine internal variation across the front (0-10
+        # turbines, spread battery values), not pinned to either edge,
+        # so there's no similar evidence they need widening.
+        # NOTE: 3000 m2 is a reasoned default, not a physically-confirmed
+        # site constraint (e.g. actual available roof/ground area at each
+        # station) — if MOPSO pins to this new bound again, it should be
+        # widened further; if real site footprint limits exist, they
+        # should replace this value before final paper numbers.
         super().__init__(n_var=3, n_obj=2,
                          xl=np.array([10.0, 0.0, 50.0]),
-                         xu=np.array([1000.0, 10.0, 2000.0]))
+                         xu=np.array([3000.0, 10.0, 2000.0]))
 
         self.pv_arr = pv_arr
         self.wind_arr = wind_arr
