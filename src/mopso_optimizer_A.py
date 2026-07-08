@@ -42,17 +42,32 @@ class MicrogridSizingProblem(ElementwiseProblem):
         # and diesel litres) was pinned exactly to the old 1000.0 bound,
         # with no exceptions — a specific signal the true unconstrained
         # optimum lies above it, not that 1000 m2 was itself optimal.
-        # n_Turbines and Battery_kWh are left unchanged: both already
-        # showed genuine internal variation across the front (0-10
-        # turbines, spread battery values), not pinned to either edge,
-        # so there's no similar evidence they need widening.
         # NOTE: 3000 m2 is a reasoned default, not a physically-confirmed
         # site constraint (e.g. actual available roof/ground area at each
         # station) — if MOPSO pins to this new bound again, it should be
         # widened further; if real site footprint limits exist, they
         # should replace this value before final paper numbers.
+        #
+        # Battery_kWh lower bound narrowed 50.0 -> 5.0: after the Area_m2
+        # widening (which drove diesel usage down ~98.6%, to ~401 L),
+        # re-checking the Battery_kWh distribution across the Salvador
+        # front showed 192/197 points pinned exactly to the old 50.0
+        # floor — the same boundary-pinning signature as Area_m2 had,
+        # just at the opposite (lower) bound: with diesel already nearly
+        # eliminated by solar, a large battery has little further value,
+        # and the optimizer wanted to go below 50.0 kWh but couldn't.
+        # 5.0 (not 0.0) keeps a small positive floor to avoid a literal
+        # division-by-zero in _fast_numba_dispatch's battery-cycle
+        # accounting (discharge_amount / battery_kwh_max).
+        #
+        # n_Turbines is left unchanged: showed genuine internal variation
+        # across the original front (0-10), not pinned to either edge —
+        # no evidence it needs widening. (Its later collapse to 0 across
+        # the board, after the Area widening, is a separate, explained
+        # effect — see mopso_optimizer_A.py's usage notes — not a bound
+        # artifact.)
         super().__init__(n_var=3, n_obj=2,
-                         xl=np.array([10.0, 0.0, 50.0]),
+                         xl=np.array([10.0, 0.0, 5.0]),
                          xu=np.array([3000.0, 10.0, 2000.0]))
 
         self.pv_arr = pv_arr
