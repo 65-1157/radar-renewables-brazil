@@ -203,10 +203,25 @@ def run_pstef_pipeline(
         site_type=site_type,
     )
 
-    # 8. STRATEGIC VALIDATION (Layer 3) — AHP-TOPSIS (now with a real
-    #    AHP-derived weight, not a hardcoded constant) + Monte Carlo
-    #    (now perturbing wind yield too, not just solar)
-    final_blueprint, risk_score = execute_decision_engine(pareto_front, params)
+    # 7b. Site-level constants needed by BOTH the Monte Carlo (step 8) and
+    #     the real economics (step 9) — computed once here, not duplicated.
+    demand_arr_full = demand.values
+    years_simulated = max(len(demand_arr_full) / 365.25, 1e-6)
+    annual_demand_kwh = np.sum(demand_arr_full) / years_simulated
+    diesel_price = (
+        params["diesel"]["trindade_price_usd_per_litre"]
+        if site_type == "remote_island"
+        else params["diesel"]["price_usd_per_litre"]
+    )
+
+    # 8. STRATEGIC VALIDATION (Layer 3) — AHP-TOPSIS (real AHP-derived
+    #    weight) + Monte Carlo (perturbs solar, wind, AND diesel price;
+    #    FIXED dimensional bug — the prior formula guaranteed budget-cap
+    #    failure on every iteration regardless of randomness, verified
+    #    via direct reproduction).
+    final_blueprint, risk_score = execute_decision_engine(
+        pareto_front, params, years_simulated, annual_demand_kwh, diesel_price,
+    )
 
     # 9. REAL ECONOMICS — economics.py's capex_usd()/npv_usd()/payback_years()
     #    were never called anywhere in the PSTEF path; dispatch_model_A.py
@@ -230,7 +245,6 @@ def run_pstef_pipeline(
             rated_speed=p_wind["rated_speed_ms"], rated_power=p_wind["rated_power_kw"],
         )
     ).values
-    demand_arr_full = demand.values
     zero_lookahead = np.zeros(len(demand_arr_full))
 
     # Diesel-only baseline: zero PV area, zero turbines, nominal battery
@@ -241,17 +255,11 @@ def run_pstef_pipeline(
         0.0, 0.0, 1.0, pv_arr_full, wind_arr_full, demand_arr_full,
         zero_lookahead, zero_lookahead, params, site_type=site_type,
     )
-    years_simulated = max(len(demand_arr_full) / 365.25, 1e-6)
-    baseline_diesel_price = (
-        params["diesel"]["trindade_price_usd_per_litre"]
-        if site_type == "remote_island"
-        else params["diesel"]["price_usd_per_litre"]
-    )
     baseline_annual_diesel_cost = (
-        (baseline_diesel_litres / years_simulated) * baseline_diesel_price
+        (baseline_diesel_litres / years_simulated) * diesel_price
     )
     blueprint_annual_diesel_cost = (
-        (final_blueprint["Diesel_Litres"] / years_simulated) * baseline_diesel_price
+        (final_blueprint["Diesel_Litres"] / years_simulated) * diesel_price
     )
     annual_saving = baseline_annual_diesel_cost - blueprint_annual_diesel_cost
 
