@@ -34,7 +34,8 @@ from src.wind_model import turbine_power_kw  # FIX 2: real power curve
 class MicrogridSizingProblem(ElementwiseProblem):
     def __init__(
         self, pv_arr, wind_arr, demand_arr,
-        lookahead_gen_arr, lookahead_dem_arr, params
+        lookahead_gen_arr, lookahead_dem_arr, params,
+        site_type: str = "coastal",
     ):
         super().__init__(n_var=3, n_obj=2,
                          xl=np.array([10.0, 0.0, 50.0]),
@@ -46,6 +47,7 @@ class MicrogridSizingProblem(ElementwiseProblem):
         self.lookahead_gen_arr = lookahead_gen_arr
         self.lookahead_dem_arr = lookahead_dem_arr
         self.params = params
+        self.site_type = site_type
 
     def _evaluate(self, x, out, *args, **kwargs):
         area_m2, n_turbines, battery_kwh = x[0], np.round(x[1]), x[2]
@@ -54,7 +56,7 @@ class MicrogridSizingProblem(ElementwiseProblem):
             area_m2, n_turbines, battery_kwh,
             self.pv_arr, self.wind_arr, self.demand_arr,
             self.lookahead_gen_arr, self.lookahead_dem_arr,
-            self.params
+            self.params, site_type=self.site_type,
         )
         out["F"] = [lcoe, diesel]
 
@@ -114,7 +116,8 @@ def precompute_lstm_lookahead(forecast_bundle, demand_series, site):
 
 
 def run_swarm_optimization(
-    actual_solar, actual_wind, demand, forecast_bundle, site, params
+    actual_solar, actual_wind, demand, forecast_bundle, site, params,
+    site_type: str = "coastal",
 ) -> pd.DataFrame:
 
     # 1. Prepare raw arrays
@@ -141,7 +144,8 @@ def run_swarm_optimization(
 
     # 3. Initialize Swarm
     problem = MicrogridSizingProblem(
-        pv_arr, wind_arr, demand_arr, lookahead_gen_arr, lookahead_dem_arr, params
+        pv_arr, wind_arr, demand_arr, lookahead_gen_arr, lookahead_dem_arr,
+        params, site_type=site_type,
     )
 
     algorithm = MOPSO_CD(pop_size=50)  # FIX 1 applied here
