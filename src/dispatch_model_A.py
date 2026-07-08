@@ -87,14 +87,20 @@ def evaluate_predictive_dispatch(
     demand_arr: np.ndarray,
     lookahead_gen_arr: np.ndarray,
     lookahead_dem_arr: np.ndarray,
-    params: dict
+    params: dict,
+    site_type: str = "coastal",
 ) -> Tuple[float, float]:
     """
     Python wrapper that extracts parameters from dictionaries and calls the
     Numba-compiled engine. Returns LCOE (USD/kWh, over a 20-year project
-    life) and TOTAL Diesel Litres over the simulated period (unchanged
-    return semantics — this is what feeds the MOPSO objective and the
-    Pareto front CSV; only the internal LCOE math is corrected).
+    life) and TOTAL Diesel Litres over the simulated period.
+
+    FIX: site_type now determines diesel price (trindade_price_usd_per_litre
+    for "remote_island", else the flat price_usd_per_litre) — previously
+    this function always used the flat price regardless of site, unlike
+    diesel_model.py's compute_diesel_metrics(), which already handled
+    this correctly. Without this fix, Ilha da Trindade's MOPSO sizing
+    would optimize against an artificially cheap diesel baseline.
     """
     total_diesel_litres, battery_cycles = _fast_numba_dispatch(
         float(area_m2),
@@ -109,10 +115,6 @@ def evaluate_predictive_dispatch(
         float(params["diesel"]["lhv_kwh_per_litre"])
     )
 
-    # FIX: demand_arr/pv_arr/wind_arr span the actual simulated period
-    # (real dataset length, ~6.25 years for 2020-2026 data), NOT one
-    # year. Must divide by years actually simulated before treating any
-    # quantity as "annual".
     years_simulated = max(len(demand_arr) / DAYS_PER_YEAR, 1e-6)
 
     lifespan_cycles = 3000.0
@@ -125,18 +127,17 @@ def evaluate_predictive_dispatch(
     replacement_cost = replacements_needed * (battery_kwh_max * params["economics"]["cost_battery_kwh"])
     crf = (0.08 * (1.0 + 0.08)**20) / ((1.0 + 0.08)**20 - 1.0)
 
-    # FIX: total_diesel_litres is a MULTI-YEAR total — annualize it
-    # before combining with the already-annualized (via CRF) capex term.
+    diesel_price = (
+        params["diesel"]["trindade_price_usd_per_litre"]
+        if site_type == "remote_island"
+        else params["diesel"]["price_usd_per_litre"]
+    )
     annual_diesel_litres = total_diesel_litres / years_simulated
-    annual_diesel_cost = annual_diesel_litres * params["diesel"]["price_usd_per_litre"]
+    annual_diesel_cost = annual_diesel_litres * diesel_price
     annualized_cost = (capex + replacement_cost) * crf + annual_diesel_cost
 
-    # Calculate LCOE over a 20-year project life
     total_lifetime_cost = annualized_cost * 20.0
 
-    # FIX: same annualization fix applied to demand — was summing the
-    # full multi-year demand_arr and treating it as one year's demand
-    # before multiplying by 20.
     annual_demand = np.sum(demand_arr) / years_simulated
     total_lifetime_demand = annual_demand * 20.0
 
