@@ -138,6 +138,25 @@ def run_pstef_pipeline(
 
     solar_fc, wind_fc = forecasters["solar"], forecasters["wind"]
 
+    # 3b. Determine site_type from sites.yaml (coastal / coastal_island /
+    #     remote_island) — needed so dispatch_model_A.py charges the
+    #     correct diesel price (trindade_price_usd_per_litre for
+    #     "remote_island", not the flat rate). Previously this lookup
+    #     didn't exist anywhere in the PSTEF path at all.
+    import yaml
+    with open("config/sites.yaml") as f:
+        sites_cfg = yaml.safe_load(f)["sites"]
+    site_type_map = {s["name"]: s["type"] for s in sites_cfg}
+    site_type = site_type_map.get(site_name, "coastal")
+    if site_name not in site_type_map:
+        logger.warning(
+            "site_type not found for '%s' in sites.yaml — defaulting to "
+            "'coastal'. If this is Ilha da Trindade, diesel pricing will "
+            "be WRONG (flat rate instead of the higher remote-island rate).",
+            site_name,
+        )
+    print(f"Site type for '{site_name}': {site_type}")
+
     # 4. REAL historical series for MOPSO (actual_solar/actual_wind), not
     #    random noise — these are the raw observed columns for the site.
     site_df = df[df["location"] == site_name].set_index("date")
@@ -180,7 +199,8 @@ def run_pstef_pipeline(
 
     # 7. RUN MOPSO (Layer 1 & Layer 2) — unchanged interface, real inputs now
     pareto_front = run_swarm_optimization(
-        actual_solar, actual_wind, demand, forecast_bundle, site_name, params
+        actual_solar, actual_wind, demand, forecast_bundle, site_name, params,
+        site_type=site_type,
     )
 
     # 8. STRATEGIC VALIDATION (Layer 3) — AHP-TOPSIS (now with a real
@@ -219,14 +239,19 @@ def run_pstef_pipeline(
     # gets used, so this has no effect on the baseline diesel figure).
     _, baseline_diesel_litres = evaluate_predictive_dispatch(
         0.0, 0.0, 1.0, pv_arr_full, wind_arr_full, demand_arr_full,
-        zero_lookahead, zero_lookahead, params,
+        zero_lookahead, zero_lookahead, params, site_type=site_type,
     )
     years_simulated = max(len(demand_arr_full) / 365.25, 1e-6)
+    baseline_diesel_price = (
+        params["diesel"]["trindade_price_usd_per_litre"]
+        if site_type == "remote_island"
+        else params["diesel"]["price_usd_per_litre"]
+    )
     baseline_annual_diesel_cost = (
-        (baseline_diesel_litres / years_simulated) * params["diesel"]["price_usd_per_litre"]
+        (baseline_diesel_litres / years_simulated) * baseline_diesel_price
     )
     blueprint_annual_diesel_cost = (
-        (final_blueprint["Diesel_Litres"] / years_simulated) * params["diesel"]["price_usd_per_litre"]
+        (final_blueprint["Diesel_Litres"] / years_simulated) * baseline_diesel_price
     )
     annual_saving = baseline_annual_diesel_cost - blueprint_annual_diesel_cost
 
