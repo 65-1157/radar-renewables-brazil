@@ -66,9 +66,18 @@ class MicrogridSizingProblem(ElementwiseProblem):
         # the board, after the Area widening, is a separate, explained
         # effect — see mopso_optimizer_A.py's usage notes — not a bound
         # artifact.)
+        #
+        # Area_m2 upper bound widened AGAIN, 3000.0 -> 5000.0: after the
+        # first widening, 5/6 sites settled at genuine interior values
+        # (2085-2837 m2), but Ilha Grande's SELECTED blueprint remained
+        # pinned exactly to the 3000.0 bound. Confirmed with the project
+        # owner that this is an exploratory study with no real physical
+        # area constraint at any site — so, per the same principle
+        # applied to the first widening, a pinned bound means the search
+        # space is still too tight, not that 3000 m2 was the answer.
         super().__init__(n_var=3, n_obj=2,
                          xl=np.array([10.0, 0.0, 5.0]),
-                         xu=np.array([3000.0, 10.0, 2000.0]))
+                         xu=np.array([5000.0, 10.0, 2000.0]))
 
         self.pv_arr = pv_arr
         self.wind_arr = wind_arr
