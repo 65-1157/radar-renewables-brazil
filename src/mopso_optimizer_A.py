@@ -162,6 +162,20 @@ def run_swarm_optimization(
         "Diesel_Litres": np.round(res.F[:, 1], 2)
     })
 
+    # DEDUPLICATE: MOPSO_CD's archive (default archive_size=200) commonly
+    # accumulates exact-duplicate points when multiple particles across
+    # generations independently converge to the same strong optimum —
+    # confirmed directly: 32/200 rows were exact duplicates for Salvador.
+    # These aren't distinct trade-off solutions, just re-discoveries of
+    # the same point, and would misleadingly inflate "N non-dominated
+    # solutions found" if reported as-is in the paper.
+    n_before = len(results_df)
+    results_df = results_df.drop_duplicates().reset_index(drop=True)
+    n_after = len(results_df)
+    if n_after < n_before:
+        print(f"Pareto front: removed {n_before - n_after} duplicate point(s) "
+              f"({n_after} genuinely distinct solutions remain)")
+
     # Was a bare relative path ("outputs/...") — real path now, matching
     # the Drive-backed results directory used throughout this project.
     from pathlib import Path
